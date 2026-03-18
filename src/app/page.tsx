@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useChat } from "@/hooks/use-chat";
+import { useSpeech } from "@/hooks/use-speech";
 import type { EntryTag } from "@/types";
 import { ENTRY_TAG_LABELS, ENTRY_TAG_ICONS } from "@/types";
 
@@ -194,20 +195,62 @@ function ChatInput({
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
 
+  // Speech recognition
+  const speech = useSpeech(
+    useCallback((text: string) => {
+      setValue((prev) => prev + text);
+    }, [])
+  );
+
   function handleSubmit() {
     const trimmed = value.trim();
     if (!trimmed || disabled) return;
+    // Stop listening if sending
+    if (speech.isListening) speech.stopListening();
     onSend(trimmed);
     setValue("");
     if (ref.current) ref.current.style.height = "auto";
   }
 
+  // Display value: current text + interim speech
+  const displayValue = speech.interim ? value + speech.interim : value;
+
   return (
     <div className="border-t border-slate-100 bg-white px-4 py-3">
+      {/* Listening indicator */}
+      {speech.isListening && (
+        <div className="mx-auto max-w-2xl mb-2 flex items-center justify-center gap-2">
+          <span className="relative flex h-2.5 w-2.5">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
+            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
+          </span>
+          <span className="text-xs text-red-500 font-medium">正在听你说...</span>
+        </div>
+      )}
+
       <div className="mx-auto flex max-w-2xl items-end gap-2">
+        {/* Mic button */}
+        {speech.isSupported && (
+          <button
+            onClick={speech.toggleListening}
+            disabled={disabled}
+            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all ${
+              speech.isListening
+                ? "bg-red-500 text-white animate-pulse"
+                : "bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700"
+            } disabled:opacity-30`}
+            title={speech.isListening ? "停止录音" : "按住说话"}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
+              <path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v8.25a3.75 3.75 0 1 1-7.5 0V4.5Z" />
+              <path d="M6 10.5a.75.75 0 0 1 .75.75v1.5a5.25 5.25 0 1 0 10.5 0v-1.5a.75.75 0 0 1 1.5 0v1.5a6.751 6.751 0 0 1-6 6.709v2.291h3a.75.75 0 0 1 0 1.5h-7.5a.75.75 0 0 1 0-1.5h3v-2.291a6.751 6.751 0 0 1-6-6.709v-1.5A.75.75 0 0 1 6 10.5Z" />
+            </svg>
+          </button>
+        )}
+
         <textarea
           ref={ref}
-          value={value}
+          value={displayValue}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -220,7 +263,7 @@ function ChatInput({
             el.style.height = "auto";
             el.style.height = Math.min(el.scrollHeight, 120) + "px";
           }}
-          placeholder="说点什么..."
+          placeholder={speech.isListening ? "说话中..." : "说点什么..."}
           disabled={disabled}
           rows={1}
           className="flex-1 resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-[15px] leading-relaxed placeholder:text-slate-400 focus:border-slate-300 focus:outline-none focus:ring-0 disabled:opacity-50"
