@@ -64,13 +64,22 @@ export async function POST(
 
     // Stream AI response
     const client = getAIClient();
-    const stream = await client.chat.completions.create({
-      model: getModel(),
-      messages: aiMessages,
-      stream: true,
-      temperature: 0.7,
-      max_tokens: 500,
-    });
+    let stream;
+    try {
+      stream = await client.chat.completions.create({
+        model: getModel(),
+        messages: aiMessages,
+        stream: true,
+        temperature: 0.7,
+        max_tokens: 500,
+      });
+    } catch (aiError) {
+      console.error('AI API error:', aiError);
+      return new Response(
+        JSON.stringify({ error: 'AI service unavailable', detail: String(aiError) }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
 
     // Create a readable stream for the response
     const encoder = new TextEncoder();
