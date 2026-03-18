@@ -3,8 +3,12 @@ import { useState, useEffect, useRef, useCallback } from "react";
 
 /**
  * TTS Hook — 优先使用豆包 TTS API，降级到浏览器原生 TTS
- * 豆包 TTS：高质量中文语音，通过 /api/tts 服务端代理
- * 浏览器 TTS：作为降级方案
+ *
+ * 修复：
+ * - useNativeTTS 改用 ref，避免 playNext 递归调用时闭包过期
+ * - playNext 通过 ref 自引用，确保递归始终调用最新版本
+ * - speak/speakSegments 不依赖 playNext 函数标识，稳定回调
+ * - 增加 safety timeout 防止音频播放卡死
  */
 export function useTTS() {
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -16,15 +20,16 @@ export function useTTS() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const unlockedRef = useRef(false);
 
-  // 浏览器原生 TTS 作为降级
+  // 用 ref 代替 state，避免递归闭包过期
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
-  const [useNativeTTS, setUseNativeTTS] = useState(false);
+  const useNativeTTSRef = useRef(false);
+
+  // playNext 自引用 ref — 递归调用始终用最新版
+  const playNextRef = useRef<(() => Promise<void>) | undefined>(undefined);
 
   useEffect(() => {
-    // 总是标记为支持（豆包 API 不依赖浏览器特性）
     setIsSupported(true);
 
-    // 初始化浏览器 TTS 作为降级
     if (typeof window !== "undefined" && window.speechSynthesis) {
       const pickVoice = () => {
         const voices = speechSynthesis.getVoices();
@@ -45,7 +50,6 @@ export function useTTS() {
     }
   }, []);
 
-  // 获取或创建 AudioContext
   const getAudioContext = useCallback(() => {
     if (!audioContextRef.current || audioContextRef.current.state === "closed") {
       audioContextRef.current = new AudioContext();
@@ -56,7 +60,6 @@ export function useTTS() {
     return audioContextRef.current;
   }, []);
 
-  // iOS/移动端音频解锁
   const unlock = useCallback(() => {
     if (unlockedRef.current) return;
     try {
@@ -66,7 +69,6 @@ export function useTTS() {
       source.buffer = buffer;
       source.connect(ctx.destination);
       source.start(0);
-      // 同时解锁浏览器 TTS
       if (typeof window !== "undefined" && window.speechSynthesis) {
         const u = new SpeechSynthesisUtterance("");
         u.volume = 0;
@@ -78,7 +80,7 @@ export function useTTS() {
     }
   }, [getAudioContext]);
 
-  // 通过豆包 API 播放文本
+  // 通过豆包 API 播放
   const playViaAPI = useCallback(
     async (text: string): Promise<boolean> => {
       try {
@@ -104,12 +106,27 @@ export function useTTS() {
         const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
 
         return new Promise<boolean>((resolve) => {
+          if (!playingRef.current) {
+            resolve(false);
+            return;
+          }
+
           const source = ctx.createBufferSource();
           source.buffer = audioBuffer;
           source.connect(ctx.destination);
           currentSourceRef.current = source;
 
+          // Safety timeout: 60 秒
+          const safetyTimeout = setTimeout(() => {
+            if (currentSourceRef.current === source) {
+              try { source.stop(); } catch { /* */ }
+              currentSourceRef.current = null;
+              resolve(true);
+            }
+          }, 60000);
+
           source.onended = () => {
+            clearTimeout(safetyTimeout);
             currentSourceRef.current = null;
             resolve(true);
           };
@@ -138,8 +155,17 @@ export function useTTS() {
         utterance.rate = 1.0;
         if (voiceRef.current) utterance.voice = voiceRef.current;
 
-        utterance.onend = () => resolve(true);
+        const safetyTimeout = setTimeout(() => {
+          speechSynthesis.cancel();
+          resolve(true);
+        }, 30000);
+
+        utterance.onend = () => {
+          clearTimeout(safetyTimeout);
+          resolve(true);
+        };
         utterance.onerror = (e) => {
+          clearTimeout(safetyTimeout);
           if (e.error !== "interrupted") console.warn("Native TTS error:", e.error);
           resolve(false);
         };
@@ -150,7 +176,7 @@ export function useTTS() {
     []
   );
 
-  // 播放队列中下一句
+  // 播放队列下一句
   const playNext = useCallback(async () => {
     if (queueRef.current.length === 0) {
       playingRef.current = false;
@@ -160,77 +186,66 @@ export function useTTS() {
 
     const text = queueRef.current.shift()!;
 
-    // 优先豆包 API，失败则降级到浏览器 TTS
     let success = false;
-    if (!useNativeTTS) {
+    // 用 ref 读 fallback 标记，不受闭包过期影响
+    if (!useNativeTTSRef.current) {
       success = await playViaAPI(text);
       if (!success && !abortControllerRef.current?.signal.aborted) {
-        // API 失败，切换到原生并标记
         console.log("Falling back to native TTS");
-        setUseNativeTTS(true);
+        useNativeTTSRef.current = true;
         success = await playViaNative(text);
       }
     } else {
       success = await playViaNative(text);
     }
 
-    // 继续播放队列中的下一句
+    // 通过 ref 递归调用最新版本，避免闭包过期
     if (playingRef.current) {
-      playNext();
+      playNextRef.current?.();
     }
-  }, [playViaAPI, playViaNative, useNativeTTS]);
+  }, [playViaAPI, playViaNative]);
 
-  // 播放单段文本
-  const speak = useCallback(
-    (text: string) => {
-      if (!text.trim()) return;
-      queueRef.current.push(text);
-      if (!playingRef.current) {
-        playingRef.current = true;
-        setIsSpeaking(true);
-        playNext();
-      }
-    },
-    [playNext]
-  );
+  // 保持 ref 同步
+  useEffect(() => {
+    playNextRef.current = playNext;
+  }, [playNext]);
 
-  // 播放多段文本
-  const speakSegments = useCallback(
-    (segments: string[]) => {
-      const valid = segments.filter((s) => s.trim());
-      if (valid.length === 0) return;
-      queueRef.current.push(...valid);
-      if (!playingRef.current) {
-        playingRef.current = true;
-        setIsSpeaking(true);
-        playNext();
-      }
-    },
-    [playNext]
-  );
+  // speak / speakSegments 通过 ref 启动，函数标识稳定
+  const speak = useCallback((text: string) => {
+    if (!text.trim()) return;
+    queueRef.current.push(text);
+    if (!playingRef.current) {
+      playingRef.current = true;
+      setIsSpeaking(true);
+      playNextRef.current?.();
+    }
+  }, []);
 
-  // 停止播放
+  const speakSegments = useCallback((segments: string[]) => {
+    const valid = segments.filter((s) => s.trim());
+    if (valid.length === 0) return;
+    queueRef.current.push(...valid);
+    if (!playingRef.current) {
+      playingRef.current = true;
+      setIsSpeaking(true);
+      playNextRef.current?.();
+    }
+  }, []);
+
   const stop = useCallback(() => {
     queueRef.current = [];
     playingRef.current = false;
 
-    // 停止 API 请求
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
 
-    // 停止当前 AudioContext 播放
     if (currentSourceRef.current) {
-      try {
-        currentSourceRef.current.stop();
-      } catch {
-        // 可能已停止
-      }
+      try { currentSourceRef.current.stop(); } catch { /* */ }
       currentSourceRef.current = null;
     }
 
-    // 停止浏览器 TTS
     if (typeof window !== "undefined" && window.speechSynthesis) {
       speechSynthesis.cancel();
     }
@@ -238,9 +253,10 @@ export function useTTS() {
     setIsSpeaking(false);
   }, []);
 
-  // 清理
   useEffect(() => {
     return () => {
+      playingRef.current = false;
+      queueRef.current = [];
       if (abortControllerRef.current) abortControllerRef.current.abort();
       if (currentSourceRef.current) {
         try { currentSourceRef.current.stop(); } catch { /* */ }
@@ -254,12 +270,5 @@ export function useTTS() {
     };
   }, []);
 
-  return {
-    speak,
-    speakSegments,
-    stop,
-    isSpeaking,
-    isSupported,
-    unlock,
-  };
+  return { speak, speakSegments, stop, isSpeaking, isSupported, unlock };
 }

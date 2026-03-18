@@ -16,35 +16,39 @@ interface UseVoiceChatOptions {
  * 语音对话编排器
  * 状态机：idle → listening → thinking → speaking → listening（循环）
  *
- * 流程：
- * 1. enterVoiceMode() → unlock TTS, startListening, state → listening
- * 2. STT finalResult → 累积文本 + 启动 1.5s 静默计时器
- * 3. 计时器到 → stopListening, state → thinking, sendMessage(text)
- * 4. AI 流式回复 → 检测完整句子，立即 TTS 播放（渐进式）
- * 5. 流式结束 + TTS 播完 → state → listening，自动 startListening
- * 6. exitVoiceMode() → 停止一切，state → idle
+ * 修复：
+ * - handleSpeechResult 用 ref 引用 speech/sendMessage，避免闭包过期
+ * - 增加卡死状态超时恢复（thinking 超时 30s 自动回 listening）
+ * - tts.speak 用稳定回调（ref），不再触发 useEffect 过度执行
+ * - 渐进式 TTS 更健壮的句子检测
  */
 export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceChatOptions) {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
-  const [currentTranscript, setCurrentTranscript] = useState(""); // 当前识别的完整文本
-  const [displayText, setDisplayText] = useState(""); // 显示的字幕文本
+  const [currentTranscript, setCurrentTranscript] = useState("");
+  const [displayText, setDisplayText] = useState("");
 
-  const accumulatedTextRef = useRef(""); // STT 累积文本
+  const accumulatedTextRef = useRef("");
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceStateRef = useRef<VoiceState>("idle");
-  const lastAssistantContentRef = useRef(""); // 追踪上次已播放的 AI 内容
-  const ttsQueuedUpToRef = useRef(0); // TTS 已排到的字符位置
+  const ttsQueuedUpToRef = useRef(0);
   const voiceStartTimeRef = useRef(0);
   const turnCountRef = useRef(0);
   const interruptCountRef = useRef(0);
   const firstResponseTimeRef = useRef(0);
+  const stuckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // 同步 ref
+  // 用 ref 保存回调，避免 handleSpeechResult 闭包过期
+  const sendMessageRef = useRef(sendMessage);
+  const speechRef = useRef<ReturnType<typeof useSpeech>>(null!);
+
+  useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
+
+  // 同步 voiceState ref
   useEffect(() => {
     voiceStateRef.current = voiceState;
   }, [voiceState]);
 
-  // STT 回调：收到最终识别结果
+  // STT 回调 — 通过 ref 引用其他 hook，永不过期
   const handleSpeechResult = useCallback((text: string) => {
     if (voiceStateRef.current !== "listening") return;
 
@@ -56,23 +60,27 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     silenceTimerRef.current = setTimeout(() => {
       const finalText = accumulatedTextRef.current.trim();
       if (finalText && voiceStateRef.current === "listening") {
-        // 停止听 → 发送消息
-        speech.stopListening();
+        speechRef.current?.stopListening();
         accumulatedTextRef.current = "";
         setVoiceState("thinking");
         setDisplayText(finalText);
         setCurrentTranscript("");
         turnCountRef.current += 1;
         firstResponseTimeRef.current = Date.now();
-        sendMessage(finalText);
+        sendMessageRef.current(finalText);
       }
     }, 1500);
-  }, [sendMessage]);
+  }, []); // 空依赖 — 全通过 ref 引用
 
   const speech = useSpeech(handleSpeechResult);
   const tts = useTTS();
 
-  // STT 自动重启：listening 状态下如果 STT 自己停了，重新启动
+  // 保持 speechRef 同步
+  useEffect(() => {
+    speechRef.current = speech;
+  });
+
+  // STT 自动重启：listening 状态下 STT 停了就重启
   useEffect(() => {
     if (voiceState === "listening" && !speech.isListening) {
       const timer = setTimeout(() => {
@@ -84,37 +92,61 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     }
   }, [voiceState, speech.isListening, speech.startListening]);
 
+  // 卡死状态恢复：thinking 超过 30s 自动回 listening
+  useEffect(() => {
+    if (voiceState === "thinking") {
+      stuckTimerRef.current = setTimeout(() => {
+        if (voiceStateRef.current === "thinking") {
+          console.warn("Voice chat stuck in thinking, recovering...");
+          setVoiceState("listening");
+          setDisplayText("");
+          ttsQueuedUpToRef.current = 0;
+          speech.startListening();
+        }
+      }, 30000);
+      return () => {
+        if (stuckTimerRef.current) {
+          clearTimeout(stuckTimerRef.current);
+          stuckTimerRef.current = null;
+        }
+      };
+    }
+  }, [voiceState, speech.startListening]);
+
   // 渐进式 TTS：监听 AI 流式回复，检测完整句子立即播放
   useEffect(() => {
     if (voiceState !== "thinking" && voiceState !== "speaking") return;
 
-    // 找到最后一条 assistant 消息
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
-    if (!lastAssistant) return;
+    if (!lastAssistant?.content) return;
 
     const fullContent = lastAssistant.content;
-    if (!fullContent) return;
-
-    // 检测新的完整句子
     const unprocessed = fullContent.slice(ttsQueuedUpToRef.current);
-    // 按中文句子结束符分割
-    const sentenceEnds = /([。！？\n])/g;
+    if (!unprocessed) return;
+
+    // 按中文/英文句子结束符分割
+    const sentenceEnds = /([。！？\n.!?])/g;
     let match;
     let lastEnd = 0;
+    const newSentences: string[] = [];
 
     while ((match = sentenceEnds.exec(unprocessed)) !== null) {
       const sentence = unprocessed.slice(lastEnd, match.index + 1).trim();
       if (sentence) {
-        tts.speak(sentence);
-        if (voiceState === "thinking") {
-          setVoiceState("speaking");
-        }
+        newSentences.push(sentence);
       }
       lastEnd = match.index + 1;
     }
 
-    if (lastEnd > 0) {
+    if (newSentences.length > 0) {
+      for (const sentence of newSentences) {
+        tts.speak(sentence);
+      }
       ttsQueuedUpToRef.current += lastEnd;
+
+      if (voiceState === "thinking") {
+        setVoiceState("speaking");
+      }
     }
 
     // 更新显示文本
@@ -124,7 +156,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
   // 流式结束后：播放剩余文本
   useEffect(() => {
     if (voiceState !== "thinking" && voiceState !== "speaking") return;
-    if (isStreaming) return; // 还在流式中，等待
+    if (isStreaming) return;
 
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
     if (!lastAssistant?.content) return;
@@ -143,7 +175,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
   // TTS 播完 → 回到 listening
   useEffect(() => {
     if (voiceState === "speaking" && !tts.isSpeaking && !isStreaming) {
-      // 延迟一点再开始听，避免 TTS 尾音被 STT 拾取
+      // 延迟避免 TTS 尾音被 STT 拾取
       const timer = setTimeout(() => {
         if (voiceStateRef.current === "speaking") {
           setVoiceState("listening");
@@ -151,7 +183,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
           ttsQueuedUpToRef.current = 0;
           speech.startListening();
         }
-      }, 500);
+      }, 600);
       return () => clearTimeout(timer);
     }
   }, [voiceState, tts.isSpeaking, isStreaming, speech.startListening]);
@@ -161,7 +193,6 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     tts.unlock();
     accumulatedTextRef.current = "";
     ttsQueuedUpToRef.current = 0;
-    lastAssistantContentRef.current = "";
     voiceStartTimeRef.current = Date.now();
     turnCountRef.current = 0;
     interruptCountRef.current = 0;
@@ -178,6 +209,10 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
+    if (stuckTimerRef.current) {
+      clearTimeout(stuckTimerRef.current);
+      stuckTimerRef.current = null;
+    }
     speech.stopListening();
     tts.stop();
     accumulatedTextRef.current = "";
@@ -189,7 +224,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
 
   // 打断：speaking 状态下点击光球
   const interrupt = useCallback(() => {
-    if (voiceState === "speaking") {
+    if (voiceStateRef.current === "speaking") {
       tts.stop();
       ttsQueuedUpToRef.current = 0;
       interruptCountRef.current += 1;
@@ -197,9 +232,8 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
       setDisplayText("");
       speech.startListening();
     }
-  }, [voiceState, tts.stop, speech.startListening]);
+  }, [tts.stop, speech.startListening]);
 
-  // 获取语音统计数据
   const getVoiceStats = useCallback(() => ({
     voiceDurationMs: voiceStartTimeRef.current
       ? Date.now() - voiceStartTimeRef.current

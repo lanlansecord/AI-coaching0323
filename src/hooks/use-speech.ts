@@ -39,6 +39,17 @@ export function useSpeech(onResult: (text: string) => void) {
   const [interim, setInterim] = useState("");
   const [isSupported, setIsSupported] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const isListeningRef = useRef(false); // ref 版本，避免闭包过期
+  const onResultRef = useRef(onResult);
+
+  // 保持 ref 同步
+  useEffect(() => {
+    onResultRef.current = onResult;
+  }, [onResult]);
+
+  useEffect(() => {
+    isListeningRef.current = isListening;
+  }, [isListening]);
 
   useEffect(() => {
     const supported =
@@ -48,7 +59,14 @@ export function useSpeech(onResult: (text: string) => void) {
   }, []);
 
   const startListening = useCallback(() => {
-    if (!isSupported || isListening) return;
+    // 用 ref 检查，避免闭包过期导致判断错误
+    if (!isSupported || isListeningRef.current) return;
+
+    // 清理旧实例
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch { /* */ }
+      recognitionRef.current = null;
+    }
 
     const SpeechRecognition =
       window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -61,6 +79,7 @@ export function useSpeech(onResult: (text: string) => void) {
 
     recognition.onstart = () => {
       setIsListening(true);
+      isListeningRef.current = true;
       setInterim("");
     };
 
@@ -78,7 +97,7 @@ export function useSpeech(onResult: (text: string) => void) {
       }
 
       if (finalText) {
-        onResult(finalText);
+        onResultRef.current(finalText);
         setInterim("");
       } else {
         setInterim(interimText);
@@ -87,38 +106,48 @@ export function useSpeech(onResult: (text: string) => void) {
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
       console.error("Speech recognition error:", event.error);
-      // Don't stop on no-speech, let user keep trying
-      if (event.error !== "no-speech") {
+      // Don't stop on no-speech or aborted, let user keep trying
+      if (event.error !== "no-speech" && event.error !== "aborted") {
         setIsListening(false);
+        isListeningRef.current = false;
         setInterim("");
       }
     };
 
     recognition.onend = () => {
       setIsListening(false);
+      isListeningRef.current = false;
       setInterim("");
     };
 
     recognitionRef.current = recognition;
-    recognition.start();
-  }, [isSupported, isListening, onResult]);
+
+    try {
+      recognition.start();
+    } catch (e) {
+      console.warn("Failed to start speech recognition:", e);
+      setIsListening(false);
+      isListeningRef.current = false;
+    }
+  }, [isSupported]); // 不再依赖 isListening state，用 ref 判断
 
   const stopListening = useCallback(() => {
     if (recognitionRef.current) {
-      recognitionRef.current.stop();
+      try { recognitionRef.current.stop(); } catch { /* */ }
       recognitionRef.current = null;
     }
     setIsListening(false);
+    isListeningRef.current = false;
     setInterim("");
   }, []);
 
   const toggleListening = useCallback(() => {
-    if (isListening) {
+    if (isListeningRef.current) {
       stopListening();
     } else {
       startListening();
     }
-  }, [isListening, startListening, stopListening]);
+  }, [startListening, stopListening]);
 
   // Cleanup on unmount
   useEffect(() => {
