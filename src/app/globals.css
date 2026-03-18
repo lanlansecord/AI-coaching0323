@@ -127,3 +127,53 @@
     @apply font-sans;
   }
 }
+
+/* ===== 语音模式动画 ===== */
+
+/* 呼吸脉动：listening + speaking */
+@keyframes voice-breathe {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.08);
+    opacity: 0.85;
+  }
+}
+
+/* 快速脉动：thinking */
+@keyframes voice-think {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 0.7;
+  }
+}
+
+/* 声波涟漪扩散：speaking */
+@keyframes voice-ripple {
+  0% {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+  100% {
+    transform: scale(2.5);
+    opacity: 0;
+  }
+}
+
+.animate-voice-breathe {
+  animation: voice-breathe 3s ease-in-out infinite;
+}
+
+.animate-voice-think {
+  animation: voice-think 1.2s ease-in-out infinite;
+}
+
+.animate-voice-ripple {
+  animation: voice-ripple 2s ease-out infinite;
+}

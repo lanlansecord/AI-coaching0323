@@ -4,6 +4,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useChat } from "@/hooks/use-chat";
 import { useSpeech } from "@/hooks/use-speech";
+import { useVoiceChat } from "@/hooks/use-voice-chat";
+import { VoiceOverlay } from "@/components/voice/VoiceOverlay";
 import type { EntryTag } from "@/types";
 import { ENTRY_TAG_LABELS, ENTRY_TAG_ICONS } from "@/types";
 
@@ -16,6 +18,13 @@ export default function HomePage() {
   const [isEnding, setIsEnding] = useState(false);
   const chat = useChat(sessionId || "");
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // 语音对话
+  const voice = useVoiceChat({
+    messages: chat.messages,
+    isStreaming: chat.isStreaming,
+    sendMessage: chat.sendMessage,
+  });
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -180,7 +189,20 @@ export default function HomePage() {
       <ChatInput
         onSend={handleSend}
         disabled={chat.isStreaming || isEnding}
+        onVoiceMode={voice.isVoiceSupported ? voice.enterVoiceMode : undefined}
       />
+
+      {/* 语音对话覆盖层 */}
+      {voice.voiceState !== "idle" && (
+        <VoiceOverlay
+          voiceState={voice.voiceState}
+          currentTranscript={voice.currentTranscript}
+          displayText={voice.displayText}
+          interim={voice.interim}
+          onClose={voice.exitVoiceMode}
+          onInterrupt={voice.interrupt}
+        />
+      )}
     </div>
   );
 }
@@ -188,9 +210,11 @@ export default function HomePage() {
 function ChatInput({
   onSend,
   disabled,
+  onVoiceMode,
 }: {
   onSend: (msg: string) => void;
   disabled: boolean;
+  onVoiceMode?: () => void;
 }) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -229,7 +253,24 @@ function ChatInput({
       )}
 
       <div className="mx-auto flex max-w-2xl items-end gap-2">
-        {/* Mic button */}
+        {/* Voice mode button */}
+        {onVoiceMode && (
+          <button
+            onClick={onVoiceMode}
+            disabled={disabled}
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-sky-400 to-cyan-500 text-white transition-all hover:from-sky-500 hover:to-cyan-600 active:scale-95 disabled:opacity-30"
+            title="语音对话模式"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+              <line x1="8" y1="23" x2="16" y2="23" />
+            </svg>
+          </button>
+        )}
+
+        {/* Mic button (text input assist) */}
         {speech.isSupported && (
           <button
             onClick={speech.toggleListening}
@@ -239,7 +280,7 @@ function ChatInput({
                 ? "bg-red-500 text-white animate-pulse"
                 : "bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700"
             } disabled:opacity-30`}
-            title={speech.isListening ? "停止录音" : "按住说话"}
+            title={speech.isListening ? "停止录音" : "语音输入"}
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
               <path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v8.25a3.75 3.75 0 1 1-7.5 0V4.5Z" />
