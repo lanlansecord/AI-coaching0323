@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { v4 as uuidv4 } from 'uuid';
+
+// Edge Runtime: 更快的冷启动，更低的延迟
+export const runtime = 'edge';
 
 /**
  * 豆包 TTS HTTP API 代理
@@ -22,7 +24,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const reqId = uuidv4();
+    const reqId = crypto.randomUUID();
     const payload = {
       app: {
         appid: appId,
@@ -33,9 +35,9 @@ export async function POST(request: NextRequest) {
         uid: 'xiaojingzi-user',
       },
       audio: {
-        voice_type: 'zh_female_shuangkuaisisi_moon_bigtts', // 温柔女声
+        voice_type: 'saturn_zh_female_wenrouwenya_tob',
         encoding: 'mp3',
-        speed_ratio: 1.0,
+        speed_ratio: 1.05,
         volume_ratio: 1.0,
         pitch_ratio: 1.0,
       },
@@ -67,19 +69,23 @@ export async function POST(request: NextRequest) {
 
     const data = await res.json();
 
-    // 豆包 TTS 返回 base64 编码的音频数据
     if (data.data) {
-      const audioBuffer = Buffer.from(data.data, 'base64');
-      return new NextResponse(audioBuffer, {
+      // Edge Runtime: 用 Uint8Array 代替 Buffer
+      const binaryString = atob(data.data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      return new NextResponse(bytes, {
         headers: {
           'Content-Type': 'audio/mpeg',
-          'Content-Length': String(audioBuffer.length),
+          'Content-Length': String(bytes.length),
           'Cache-Control': 'no-cache',
         },
       });
     }
 
-    // 可能的错误响应
     if (data.code && data.code !== 3000) {
       console.error('TTS error response:', data);
       return NextResponse.json(

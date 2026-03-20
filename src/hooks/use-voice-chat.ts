@@ -69,7 +69,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
         firstResponseTimeRef.current = Date.now();
         sendMessageRef.current(finalText);
       }
-    }, 1500);
+    }, 1000);
   }, []); // 空依赖 — 全通过 ref 引用
 
   const speech = useSpeech(handleSpeechResult);
@@ -124,8 +124,8 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     const unprocessed = fullContent.slice(ttsQueuedUpToRef.current);
     if (!unprocessed) return;
 
-    // 按中文/英文句子结束符分割
-    const sentenceEnds = /([。！？\n.!?])/g;
+    // 按中文/英文标点分割（含逗号、分号，更早开始播放）
+    const sentenceEnds = /([。！？\n.!?，,；;：:])/g;
     let match;
     let lastEnd = 0;
     const newSentences: string[] = [];
@@ -183,7 +183,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
           ttsQueuedUpToRef.current = 0;
           speech.startListening();
         }
-      }, 600);
+      }, 300);
       return () => clearTimeout(timer);
     }
   }, [voiceState, tts.isSpeaking, isStreaming, speech.startListening]);

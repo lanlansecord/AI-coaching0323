@@ -4,11 +4,11 @@ import { useState, useEffect, useRef, useCallback } from "react";
 /**
  * TTS Hook — 优先使用豆包 TTS API，降级到浏览器原生 TTS
  *
- * 修复：
- * - useNativeTTS 改用 ref，避免 playNext 递归调用时闭包过期
- * - playNext 通过 ref 自引用，确保递归始终调用最新版本
- * - speak/speakSegments 不依赖 playNext 函数标识，稳定回调
- * - 增加 safety timeout 防止音频播放卡死
+ * 性能优化：
+ * - 预取机制：speak() 调用时立即发起 fetch，播放时直接用缓存音频
+ *   原来：[fetch A] → [play A] → [fetch B] → [play B]（串行，每句多等一个网络 RTT）
+ *   现在：[fetch A] → [play A + fetch B already done] → [play B]（并行，消除等待）
+ * - 稳定回调：speak/stop 函数标识不变，避免触发外层 effect 重跑
  */
 export function useTTS() {
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -20,12 +20,12 @@ export function useTTS() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const unlockedRef = useRef(false);
 
-  // 用 ref 代替 state，避免递归闭包过期
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const useNativeTTSRef = useRef(false);
-
-  // playNext 自引用 ref — 递归调用始终用最新版
   const playNextRef = useRef<(() => Promise<void>) | undefined>(undefined);
+
+  // 预取缓存：text → Promise<ArrayBuffer | null>
+  const audioCacheRef = useRef<Map<string, Promise<ArrayBuffer | null>>>(new Map());
 
   useEffect(() => {
     setIsSupported(true);
@@ -80,7 +80,73 @@ export function useTTS() {
     }
   }, [getAudioContext]);
 
-  // 通过豆包 API 播放
+  // 预取音频：立即发起 fetch，返回 Promise，结果缓存
+  const prefetchAudio = useCallback((text: string) => {
+    const existing = audioCacheRef.current.get(text);
+    if (existing) return existing;
+
+    const promise = (async (): Promise<ArrayBuffer | null> => {
+      try {
+        const res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (!res.ok) return null;
+        const buf = await res.arrayBuffer();
+        return buf.byteLength > 0 ? buf : null;
+      } catch {
+        return null;
+      }
+    })();
+
+    audioCacheRef.current.set(text, promise);
+    return promise;
+  }, []);
+
+  // 播放 ArrayBuffer（已解码的音频）
+  const playArrayBuffer = useCallback(
+    async (arrayBuffer: ArrayBuffer): Promise<boolean> => {
+      try {
+        const ctx = getAudioContext();
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+        return new Promise<boolean>((resolve) => {
+          if (!playingRef.current) {
+            resolve(false);
+            return;
+          }
+
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(ctx.destination);
+          currentSourceRef.current = source;
+
+          const safetyTimeout = setTimeout(() => {
+            if (currentSourceRef.current === source) {
+              try { source.stop(); } catch { /* */ }
+              currentSourceRef.current = null;
+              resolve(true);
+            }
+          }, 60000);
+
+          source.onended = () => {
+            clearTimeout(safetyTimeout);
+            currentSourceRef.current = null;
+            resolve(true);
+          };
+
+          source.start(0);
+        });
+      } catch (error) {
+        console.warn("Audio playback failed:", error);
+        return false;
+      }
+    },
+    [getAudioContext]
+  );
+
+  // 通过豆包 API 播放（无缓存时的 fallback）
   const playViaAPI = useCallback(
     async (text: string): Promise<boolean> => {
       try {
@@ -102,47 +168,17 @@ export function useTTS() {
         const arrayBuffer = await res.arrayBuffer();
         if (arrayBuffer.byteLength === 0) return false;
 
-        const ctx = getAudioContext();
-        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-
-        return new Promise<boolean>((resolve) => {
-          if (!playingRef.current) {
-            resolve(false);
-            return;
-          }
-
-          const source = ctx.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(ctx.destination);
-          currentSourceRef.current = source;
-
-          // Safety timeout: 60 秒
-          const safetyTimeout = setTimeout(() => {
-            if (currentSourceRef.current === source) {
-              try { source.stop(); } catch { /* */ }
-              currentSourceRef.current = null;
-              resolve(true);
-            }
-          }, 60000);
-
-          source.onended = () => {
-            clearTimeout(safetyTimeout);
-            currentSourceRef.current = null;
-            resolve(true);
-          };
-
-          source.start(0);
-        });
+        return playArrayBuffer(arrayBuffer);
       } catch (error) {
         if ((error as Error).name === "AbortError") return false;
         console.warn("TTS API playback failed:", error);
         return false;
       }
     },
-    [getAudioContext]
+    [playArrayBuffer]
   );
 
-  // 通过浏览器原生 TTS 播放
+  // 浏览器原生 TTS 播放
   const playViaNative = useCallback(
     (text: string): Promise<boolean> => {
       return new Promise((resolve) => {
@@ -176,21 +212,36 @@ export function useTTS() {
     []
   );
 
-  // 播放队列下一句
+  // 播放队列下一句 — 优先使用预取缓存
   const playNext = useCallback(async () => {
     if (queueRef.current.length === 0) {
       playingRef.current = false;
       setIsSpeaking(false);
+      audioCacheRef.current.clear();
       return;
     }
 
     const text = queueRef.current.shift()!;
 
     let success = false;
-    // 用 ref 读 fallback 标记，不受闭包过期影响
     if (!useNativeTTSRef.current) {
-      success = await playViaAPI(text);
-      if (!success && !abortControllerRef.current?.signal.aborted) {
+      // 优先使用预取缓存
+      const cachedPromise = audioCacheRef.current.get(text);
+      if (cachedPromise) {
+        const arrayBuffer = await cachedPromise;
+        audioCacheRef.current.delete(text);
+        if (arrayBuffer && playingRef.current) {
+          success = await playArrayBuffer(arrayBuffer);
+        }
+      }
+
+      // 缓存没命中或播放失败 → 直接请求
+      if (!success && playingRef.current) {
+        success = await playViaAPI(text);
+      }
+
+      // API 彻底失败 → 降级浏览器 TTS
+      if (!success && playingRef.current && !abortControllerRef.current?.signal.aborted) {
         console.log("Falling back to native TTS");
         useNativeTTSRef.current = true;
         success = await playViaNative(text);
@@ -199,42 +250,56 @@ export function useTTS() {
       success = await playViaNative(text);
     }
 
-    // 通过 ref 递归调用最新版本，避免闭包过期
     if (playingRef.current) {
       playNextRef.current?.();
     }
-  }, [playViaAPI, playViaNative]);
+  }, [playArrayBuffer, playViaAPI, playViaNative]);
 
-  // 保持 ref 同步
   useEffect(() => {
     playNextRef.current = playNext;
   }, [playNext]);
 
-  // speak / speakSegments 通过 ref 启动，函数标识稳定
+  // speak：推入队列 + 立即预取音频
   const speak = useCallback((text: string) => {
     if (!text.trim()) return;
     queueRef.current.push(text);
+
+    // 立即发起预取（不等播放到这句）
+    if (!useNativeTTSRef.current) {
+      prefetchAudio(text);
+    }
+
     if (!playingRef.current) {
       playingRef.current = true;
       setIsSpeaking(true);
       playNextRef.current?.();
     }
-  }, []);
+  }, [prefetchAudio]);
 
   const speakSegments = useCallback((segments: string[]) => {
     const valid = segments.filter((s) => s.trim());
     if (valid.length === 0) return;
-    queueRef.current.push(...valid);
+
+    for (const seg of valid) {
+      queueRef.current.push(seg);
+      if (!useNativeTTSRef.current) {
+        prefetchAudio(seg);
+      }
+    }
+
     if (!playingRef.current) {
       playingRef.current = true;
       setIsSpeaking(true);
       playNextRef.current?.();
     }
-  }, []);
+  }, [prefetchAudio]);
 
   const stop = useCallback(() => {
     queueRef.current = [];
     playingRef.current = false;
+
+    // 清理预取缓存
+    audioCacheRef.current.clear();
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -257,6 +322,7 @@ export function useTTS() {
     return () => {
       playingRef.current = false;
       queueRef.current = [];
+      audioCacheRef.current.clear();
       if (abortControllerRef.current) abortControllerRef.current.abort();
       if (currentSourceRef.current) {
         try { currentSourceRef.current.stop(); } catch { /* */ }
