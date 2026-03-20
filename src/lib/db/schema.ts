@@ -30,6 +30,8 @@ export const sessions = pgTable('sessions', {
   mode: varchar('mode', { length: 10 }).notNull().default('text'), // 'text' | 'voice'
   aiModel: varchar('ai_model', { length: 50 }),
   promptVersion: varchar('prompt_version', { length: 20 }),
+  title: varchar('title', { length: 200 }),                  // 自动生成的对话标题，如"走出拖延-如何克服写作焦虑"
+  isFavorite: boolean('is_favorite').default(false),          // 收藏标记
   status: varchar('status', { length: 20 }).notNull().default('active'),
   completionReason: varchar('completion_reason', { length: 20 }),
   summaryJson: jsonb('summary_json'),

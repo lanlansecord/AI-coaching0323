@@ -77,16 +77,45 @@ export async function POST(
       };
     }
 
-    // Save summary and mark completed
+    // 自动生成标题：用 AI 基于对话内容生成简短标题
+    let title = '';
+    try {
+      const TAG_CN: Record<string, string> = {
+        clarity: '理清思路',
+        emotion: '梳理情绪',
+        procrastination: '走出拖延',
+        general: '自由对话',
+      };
+      const tagLabel = TAG_CN[session.entryTag] || '自由对话';
+      const titleCompletion = await client.chat.completions.create({
+        model: getModel(),
+        messages: [{
+          role: 'user',
+          content: `请根据以下对话内容，生成一个简短的对话标题（10字以内），格式为"${tagLabel}-具体主题"。只输出标题本身，不要加引号或其他内容。\n\n${conversationText.slice(0, 1000)}`,
+        }],
+        temperature: 0.3,
+        max_tokens: 50,
+      });
+      title = titleCompletion.choices[0]?.message?.content?.trim() || '';
+      // 如果 AI 没按格式来，手动拼
+      if (title && !title.startsWith(tagLabel)) {
+        title = `${tagLabel}-${title}`;
+      }
+    } catch {
+      // 标题生成失败不影响主流程
+    }
+
+    // Save summary, title, and mark completed
     await db
       .update(sessions)
       .set({
         summaryJson,
+        title: title || null,
         status: 'completed',
       })
       .where(eq(sessions.id, sessionId));
 
-    return NextResponse.json({ summary: summaryJson });
+    return NextResponse.json({ summary: summaryJson, title });
   } catch (error) {
     console.error('Complete error:', error);
     return NextResponse.json(

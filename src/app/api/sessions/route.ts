@@ -38,6 +38,8 @@ export async function GET() {
         entryTag: sessions.entryTag,
         mode: sessions.mode,
         status: sessions.status,
+        title: sessions.title,
+        isFavorite: sessions.isFavorite,
         createdAt: sessions.createdAt,
         lastMessageAt: sessions.lastMessageAt,
         summaryJson: sessions.summaryJson,
