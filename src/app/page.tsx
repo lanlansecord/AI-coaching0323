@@ -282,6 +282,8 @@ export default function HomePage() {
           currentTranscript={voice.currentTranscript}
           displayText={voice.displayText}
           interim={voice.interim}
+          audioLevel={voice.audioLevel}
+          turnCount={voice.turnCount}
           onClose={voice.exitVoiceMode}
           onInterrupt={voice.interrupt}
         />

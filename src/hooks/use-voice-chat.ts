@@ -2,6 +2,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useSpeech } from "./use-speech";
 import { useTTS } from "./use-tts";
+import { useAudioLevel } from "./use-audio-level";
 import type { ChatMessage } from "./use-chat";
 
 export type VoiceState = "idle" | "listening" | "thinking" | "speaking";
@@ -13,14 +14,11 @@ interface UseVoiceChatOptions {
 }
 
 /**
- * 语音对话编排器
- * 状态机：idle → listening → thinking → speaking → listening（循环）
- *
- * 修复：
- * - handleSpeechResult 用 ref 引用 speech/sendMessage，避免闭包过期
- * - 增加卡死状态超时恢复（thinking 超时 30s 自动回 listening）
- * - tts.speak 用稳定回调（ref），不再触发 useEffect 过度执行
- * - 渐进式 TTS 更健壮的句子检测
+ * 语音对话编排器 v2
+ * 新增：
+ * - 音量检测 + 音量响应式光球
+ * - 进入语音模式时自动播放最近 AI 消息作为欢迎语
+ * - 轮次计数暴露给 UI
  */
 export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceChatOptions) {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
@@ -33,54 +31,56 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
   const ttsQueuedUpToRef = useRef(0);
   const voiceStartTimeRef = useRef(0);
   const turnCountRef = useRef(0);
+  const [turnCount, setTurnCount] = useState(0);
   const interruptCountRef = useRef(0);
   const firstResponseTimeRef = useRef(0);
   const stuckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const greetingPlayedRef = useRef(false);
 
-  // 用 ref 保存回调，避免 handleSpeechResult 闭包过期
   const sendMessageRef = useRef(sendMessage);
   const speechRef = useRef<ReturnType<typeof useSpeech>>(null!);
 
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
-  // 同步 voiceState ref
   useEffect(() => {
     voiceStateRef.current = voiceState;
   }, [voiceState]);
 
-  // STT 回调 — 通过 ref 引用其他 hook，永不过期
+  // STT 回调
   const handleSpeechResult = useCallback((text: string) => {
     if (voiceStateRef.current !== "listening") return;
 
     accumulatedTextRef.current += text;
     setCurrentTranscript(accumulatedTextRef.current);
 
-    // 重置静默计时器
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = setTimeout(() => {
       const finalText = accumulatedTextRef.current.trim();
       if (finalText && voiceStateRef.current === "listening") {
         speechRef.current?.stopListening();
+        audioLevelHook.stop();
         accumulatedTextRef.current = "";
         setVoiceState("thinking");
         setDisplayText(finalText);
         setCurrentTranscript("");
         turnCountRef.current += 1;
+        setTurnCount(turnCountRef.current);
         firstResponseTimeRef.current = Date.now();
         sendMessageRef.current(finalText);
       }
     }, 1000);
-  }, []); // 空依赖 — 全通过 ref 引用
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const speech = useSpeech(handleSpeechResult);
   const tts = useTTS();
+  const audioLevelHook = useAudioLevel(0.03, 800);
 
-  // 保持 speechRef 同步
   useEffect(() => {
     speechRef.current = speech;
   });
 
-  // STT 自动重启：listening 状态下 STT 停了就重启
+  // STT 自动重启
   useEffect(() => {
     if (voiceState === "listening" && !speech.isListening) {
       const timer = setTimeout(() => {
@@ -92,7 +92,21 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     }
   }, [voiceState, speech.isListening, speech.startListening]);
 
-  // 卡死状态恢复：thinking 超过 30s 自动回 listening
+  // 音量检测同步：listening 时开始，其他状态停止
+  useEffect(() => {
+    if (voiceState === "listening") {
+      if (!audioLevelHook.isActive) {
+        audioLevelHook.start();
+      }
+    } else {
+      if (audioLevelHook.isActive) {
+        audioLevelHook.stop();
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceState]);
+
+  // 卡死恢复
   useEffect(() => {
     if (voiceState === "thinking") {
       stuckTimerRef.current = setTimeout(() => {
@@ -113,7 +127,7 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     }
   }, [voiceState, speech.startListening]);
 
-  // 渐进式 TTS：监听 AI 流式回复，检测完整句子立即播放
+  // 渐进式 TTS
   useEffect(() => {
     if (voiceState !== "thinking" && voiceState !== "speaking") return;
 
@@ -124,7 +138,6 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     const unprocessed = fullContent.slice(ttsQueuedUpToRef.current);
     if (!unprocessed) return;
 
-    // 按中文/英文标点分割（含逗号、分号，更早开始播放）
     const sentenceEnds = /([。！？\n.!?，,；;：:])/g;
     let match;
     let lastEnd = 0;
@@ -149,11 +162,10 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
       }
     }
 
-    // 更新显示文本
     setDisplayText(fullContent);
   }, [voiceState, messages, tts.speak]);
 
-  // 流式结束后：播放剩余文本
+  // 流式结束后播放剩余
   useEffect(() => {
     if (voiceState !== "thinking" && voiceState !== "speaking") return;
     if (isStreaming) return;
@@ -172,20 +184,21 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     }
   }, [isStreaming, voiceState, messages, tts.speak]);
 
-  // TTS 播完 → 回到 listening
+  // TTS 播完 → listening
   useEffect(() => {
     if (voiceState === "speaking" && !tts.isSpeaking && !isStreaming) {
-      // 延迟避免 TTS 尾音被 STT 拾取
       const timer = setTimeout(() => {
         if (voiceStateRef.current === "speaking") {
           setVoiceState("listening");
           setDisplayText("");
           ttsQueuedUpToRef.current = 0;
           speech.startListening();
+          audioLevelHook.start();
         }
       }, 300);
       return () => clearTimeout(timer);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceState, tts.isSpeaking, isStreaming, speech.startListening]);
 
   // 进入语音模式
@@ -195,15 +208,35 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     ttsQueuedUpToRef.current = 0;
     voiceStartTimeRef.current = Date.now();
     turnCountRef.current = 0;
+    setTurnCount(0);
     interruptCountRef.current = 0;
     firstResponseTimeRef.current = 0;
+    greetingPlayedRef.current = false;
     setCurrentTranscript("");
     setDisplayText("");
-    setVoiceState("listening");
-    speech.startListening();
-  }, [tts.unlock, speech.startListening]);
 
-  // 退出语音模式
+    // 播放欢迎语：最近一条 AI 消息
+    const lastAI = [...messages].reverse().find((m) => m.role === "assistant");
+    if (lastAI?.content && !greetingPlayedRef.current) {
+      greetingPlayedRef.current = true;
+      setVoiceState("speaking");
+
+      // 截取前 100 字作为欢迎语，避免太长
+      const greeting = lastAI.content.length > 100
+        ? lastAI.content.slice(0, 100)
+        : lastAI.content;
+      setDisplayText(greeting);
+      tts.speak(greeting);
+      ttsQueuedUpToRef.current = lastAI.content.length; // 标记全部已处理
+    } else {
+      setVoiceState("listening");
+      speech.startListening();
+      audioLevelHook.start();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tts.unlock, speech.startListening, messages]);
+
+  // 退出
   const exitVoiceMode = useCallback(() => {
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
@@ -215,14 +248,16 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     }
     speech.stopListening();
     tts.stop();
+    audioLevelHook.stop();
     accumulatedTextRef.current = "";
     ttsQueuedUpToRef.current = 0;
     setVoiceState("idle");
     setCurrentTranscript("");
     setDisplayText("");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [speech.stopListening, tts.stop]);
 
-  // 打断：speaking 状态下点击光球
+  // 打断
   const interrupt = useCallback(() => {
     if (voiceStateRef.current === "speaking") {
       tts.stop();
@@ -231,7 +266,9 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
       setVoiceState("listening");
       setDisplayText("");
       speech.startListening();
+      audioLevelHook.start();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tts.stop, speech.startListening]);
 
   const getVoiceStats = useCallback(() => ({
@@ -250,6 +287,8 @@ export function useVoiceChat({ messages, isStreaming, sendMessage }: UseVoiceCha
     currentTranscript,
     displayText,
     interim: speech.interim,
+    audioLevel: audioLevelHook.audioLevel,
+    turnCount,
     isVoiceSupported: speech.isSupported && tts.isSupported,
     enterVoiceMode,
     exitVoiceMode,
