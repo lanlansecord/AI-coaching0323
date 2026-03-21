@@ -34,13 +34,21 @@ declare global {
   }
 }
 
+interface StartListeningOptions {
+  continuous?: boolean;
+}
+
 export function useSpeech(onResult: (text: string) => void) {
   const [isListening, setIsListening] = useState(false);
   const [interim, setInterim] = useState("");
-  const [isSupported, setIsSupported] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const isListeningRef = useRef(false); // ref 版本，避免闭包过期
   const onResultRef = useRef(onResult);
+  const interimRef = useRef("");
+  const shouldFlushOnEndRef = useRef(true);
+  const isSupported =
+    typeof window !== "undefined" &&
+    ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
 
   // 保持 ref 同步
   useEffect(() => {
@@ -52,13 +60,18 @@ export function useSpeech(onResult: (text: string) => void) {
   }, [isListening]);
 
   useEffect(() => {
-    const supported =
-      typeof window !== "undefined" &&
-      ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
-    setIsSupported(supported);
+    interimRef.current = interim;
+  }, [interim]);
+
+  const flushInterim = useCallback(() => {
+    const text = interimRef.current.trim();
+    if (!text) return;
+    onResultRef.current(text);
+    interimRef.current = "";
+    setInterim("");
   }, []);
 
-  const startListening = useCallback(() => {
+  const startListening = useCallback((options?: StartListeningOptions) => {
     // 用 ref 检查，避免闭包过期导致判断错误
     if (!isSupported || isListeningRef.current) return;
 
@@ -73,9 +86,10 @@ export function useSpeech(onResult: (text: string) => void) {
     const recognition = new SpeechRecognition();
 
     recognition.lang = "zh-CN";
-    recognition.continuous = true;
+    recognition.continuous = options?.continuous ?? true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
+    shouldFlushOnEndRef.current = true;
 
     recognition.onstart = () => {
       setIsListening(true);
@@ -98,8 +112,10 @@ export function useSpeech(onResult: (text: string) => void) {
 
       if (finalText) {
         onResultRef.current(finalText);
+        interimRef.current = "";
         setInterim("");
       } else {
+        interimRef.current = interimText;
         setInterim(interimText);
       }
     };
@@ -115,6 +131,9 @@ export function useSpeech(onResult: (text: string) => void) {
     };
 
     recognition.onend = () => {
+      if (shouldFlushOnEndRef.current) {
+        flushInterim();
+      }
       setIsListening(false);
       isListeningRef.current = false;
       setInterim("");
@@ -129,9 +148,13 @@ export function useSpeech(onResult: (text: string) => void) {
       setIsListening(false);
       isListeningRef.current = false;
     }
-  }, [isSupported]); // 不再依赖 isListening state，用 ref 判断
+  }, [flushInterim, isSupported]); // 不再依赖 isListening state，用 ref 判断
 
-  const stopListening = useCallback(() => {
+  const stopListening = useCallback((options?: { flushInterim?: boolean }) => {
+    shouldFlushOnEndRef.current = options?.flushInterim !== false;
+    if (options?.flushInterim !== false) {
+      flushInterim();
+    }
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch { /* */ }
       recognitionRef.current = null;
@@ -139,7 +162,7 @@ export function useSpeech(onResult: (text: string) => void) {
     setIsListening(false);
     isListeningRef.current = false;
     setInterim("");
-  }, []);
+  }, [flushInterim]);
 
   const toggleListening = useCallback(() => {
     if (isListeningRef.current) {

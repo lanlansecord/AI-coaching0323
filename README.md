@@ -1,4 +1,6 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+## 小镜子
+
+小镜子是一个中文 AI 成长陪练 Web 应用，当前基于 `Next.js 16 + App Router + Route Handlers + Neon + Drizzle`。
 
 ## Getting Started
 
@@ -16,21 +18,52 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Deploy to Netlify
 
-## Learn More
+这个项目可以直接导入 Netlify 部署。
 
-To learn more about Next.js, take a look at the following resources:
+### 1. 导入项目
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+在 Netlify 后台选择 `Add new project`，导入这个仓库。
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### 2. 构建设置
 
-## Deploy on Vercel
+- Base directory：留空
+- Build command：`npm run build`
+- Publish directory：`.next`
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+仓库里已经提供了：
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `netlify.toml`
+- `.node-version`
+
+### 3. 必填环境变量
+
+至少需要把下面这些变量填到 Netlify 的 Site configuration -> Environment variables：
+
+- `AI_API_KEY`
+- `AI_MODEL`
+- `DATABASE_URL`
+- `COOKIE_SECRET`
+- `ADMIN_PASSWORD`
+
+如果要继续保留语音相关能力，还需要补对应的火山环境变量：
+
+- `NEXT_PUBLIC_VOICE_PROVIDER`
+- `VOLC_*`
+
+参考本地示例文件：
+
+- `.env.example`
+
+### 4. 首次发布后建议检查
+
+- `/api/sessions`
+- `/api/auth/*`
+- `/api/admin/*`
+- `/api/tts`
+- `/api/voice/realtime/*`
+
+如果这些接口都能正常返回，说明 Netlify 侧的 SSR 和 Route Handlers 已经接住了。

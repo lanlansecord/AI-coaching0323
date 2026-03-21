@@ -31,3 +31,53 @@ export async function GET(
     );
   }
 }
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id: sessionId } = await params;
+
+  try {
+    const body = (await request.json()) as {
+      role?: string;
+      content?: string;
+      inputMode?: string;
+    };
+
+    if (!body.role || !body.content?.trim()) {
+      return NextResponse.json(
+        { error: 'role and content are required' },
+        { status: 400 }
+      );
+    }
+
+    if (body.role !== 'user' && body.role !== 'assistant') {
+      return NextResponse.json({ error: 'invalid role' }, { status: 400 });
+    }
+
+    const [message] = await db
+      .insert(messages)
+      .values({
+        sessionId,
+        role: body.role,
+        content: body.content.trim(),
+        inputMode: body.inputMode === 'voice' ? 'voice' : 'text',
+      })
+      .returning();
+
+    return NextResponse.json({
+      message: {
+        id: message.id,
+        role: message.role,
+        content: message.content,
+      },
+    });
+  } catch (error) {
+    console.error('Message create error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}

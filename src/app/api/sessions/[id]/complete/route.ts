@@ -7,12 +7,25 @@ import { buildSummaryPrompt } from '@/lib/ai/summary';
 import type { EntryTag } from '@/types';
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: sessionId } = await params;
 
   try {
+    const body = await request.json().catch(() => ({}));
+    const mode = body.mode === 'voice' ? 'voice' : 'text';
+    const voiceDurationMs =
+      typeof body.voiceDurationMs === 'number' ? body.voiceDurationMs : null;
+    const voiceTurnCount =
+      typeof body.voiceTurnCount === 'number' ? body.voiceTurnCount : null;
+    const interruptCount =
+      typeof body.interruptCount === 'number' ? body.interruptCount : null;
+    const firstResponseLatencyMs =
+      typeof body.firstResponseLatencyMs === 'number'
+        ? body.firstResponseLatencyMs
+        : null;
+
     // Get session
     const [session] = await db
       .select()
@@ -109,9 +122,15 @@ export async function POST(
     await db
       .update(sessions)
       .set({
+        mode,
         summaryJson,
         title: title || null,
         status: 'completed',
+        voiceDurationMs,
+        voiceTurnCount,
+        interruptCount,
+        firstResponseLatencyMs,
+        endedAt: new Date(),
       })
       .where(eq(sessions.id, sessionId));
 

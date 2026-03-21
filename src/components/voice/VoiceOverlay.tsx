@@ -10,6 +10,8 @@ interface VoiceOverlayProps {
   interim: string;
   audioLevel: number;
   turnCount: number;
+  providerLabel?: string;
+  fallbackReason?: string | null;
   onClose: () => void;
   onInterrupt: () => void;
 }
@@ -35,6 +37,8 @@ export function VoiceOverlay({
   interim,
   audioLevel,
   turnCount,
+  providerLabel,
+  fallbackReason,
   onClose,
   onInterrupt,
 }: VoiceOverlayProps) {
@@ -110,7 +114,7 @@ export function VoiceOverlay({
         <div className="flex items-center gap-2">
           <span className="text-lg">🪞</span>
           <span className="text-white/50 text-xs font-light tracking-wider">
-            语音模式
+            {providerLabel || "语音模式"}
           </span>
           {turnCount > 0 && (
             <span className="text-white/30 text-[11px] ml-1">
@@ -176,6 +180,12 @@ export function VoiceOverlay({
         >
           {getSubtitle()}
         </div>
+
+        {fallbackReason && (
+          <p className="mt-3 text-center text-[11px] leading-relaxed text-white/30">
+            {fallbackReason}
+          </p>
+        )}
 
         {/* 操作提示 */}
         <div className="text-center mt-3 h-4">

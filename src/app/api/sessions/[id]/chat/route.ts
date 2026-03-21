@@ -15,6 +15,7 @@ export async function POST(
   try {
     const body = await request.json();
     const userMessage = body.message?.trim();
+    const inputMode = body.inputMode === 'voice' ? 'voice' : 'text';
 
     if (!userMessage) {
       return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -42,6 +43,7 @@ export async function POST(
       sessionId,
       role: 'user',
       content: userMessage,
+      inputMode,
     });
 
     // Get message history

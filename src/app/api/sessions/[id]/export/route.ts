@@ -205,7 +205,7 @@ async function generateDocx(
   children.push(
     new Paragraph({
       children: [
-        new TextRun({ text: '\n\n由「小镜子」AI 生活教练生成 · xiaojingzi.vercel.app', size: 16, color: 'AAAAAA' }),
+        new TextRun({ text: '\n\n由「小镜子」AI 生活教练生成', size: 16, color: 'AAAAAA' }),
       ],
       alignment: AlignmentType.CENTER,
       spacing: { before: 600 },

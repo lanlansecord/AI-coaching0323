@@ -6,6 +6,9 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  inputMode?: "text" | "voice";
+  audioUrl?: string;
+  audioDurationMs?: number;
 }
 
 export function useChat(sessionId: string) {
@@ -18,7 +21,14 @@ export function useChat(sessionId: string) {
   }, []);
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (
+      content: string,
+      options?: {
+        inputMode?: "text" | "voice";
+        audioUrl?: string;
+        audioDurationMs?: number;
+      }
+    ) => {
       if (isStreaming || !content.trim()) return;
 
       // Add user message optimistically
@@ -26,6 +36,9 @@ export function useChat(sessionId: string) {
         id: `user-${Date.now()}`,
         role: "user",
         content: content.trim(),
+        inputMode: options?.inputMode || "text",
+        audioUrl: options?.audioUrl,
+        audioDurationMs: options?.audioDurationMs,
       };
       setMessages((prev) => [...prev, userMsg]);
 
@@ -45,7 +58,10 @@ export function useChat(sessionId: string) {
         const response = await fetch(`/api/sessions/${sessionId}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: content.trim() }),
+          body: JSON.stringify({
+            message: content.trim(),
+            inputMode: options?.inputMode || "text",
+          }),
           signal: abortRef.current.signal,
         });
 
@@ -105,5 +121,15 @@ export function useChat(sessionId: string) {
     [sessionId, isStreaming]
   );
 
-  return { messages, isStreaming, sendMessage, initMessages };
+  const appendMessage = useCallback((message: Omit<ChatMessage, "id">) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${message.role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        ...message,
+      },
+    ]);
+  }, []);
+
+  return { messages, isStreaming, sendMessage, initMessages, appendMessage };
 }
