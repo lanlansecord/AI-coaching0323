@@ -3,35 +3,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useChat } from "@/hooks/use-chat";
-import { useWavRecorder } from "@/hooks/use-wav-recorder";
-import { useVoiceChat } from "@/hooks/use-voice-chat";
-import { VoiceOverlay } from "@/components/voice/VoiceOverlay";
+import { useAudioRecorder } from "@/hooks/use-audio-recorder";
 import type { EntryTag } from "@/types";
 import { ENTRY_TAG_LABELS, ENTRY_TAG_ICONS } from "@/types";
 
 const tags: EntryTag[] = ["clarity", "emotion", "procrastination"];
-
-function isEditableElement(target: EventTarget | null) {
-  if (!(target instanceof HTMLElement)) return false;
-  const tagName = target.tagName;
-  return (
-    tagName === "INPUT" ||
-    tagName === "TEXTAREA" ||
-    tagName === "SELECT" ||
-    target.isContentEditable
-  );
-}
-
-function shouldUseSpaceForVoiceShortcut(target: EventTarget | null, currentValue: string) {
-  if (!(target instanceof HTMLElement)) return true;
-  if (!isEditableElement(target)) return true;
-
-  // 输入框里已经有文字时，保留正常空格输入。
-  if (currentValue.trim()) return false;
-
-  // 空输入框允许直接按住空格开始录音。
-  return true;
-}
 
 interface UserInfo {
   id: string;
@@ -45,6 +21,21 @@ function formatVoiceDuration(durationMs?: number) {
   return `${totalSeconds}"`;
 }
 
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Failed to read audio blob"));
+      }
+    };
+    reader.onerror = () => reject(reader.error || new Error("Failed to read audio blob"));
+    reader.readAsDataURL(blob);
+  });
+}
+
 export default function HomePage() {
   const router = useRouter();
   const [user, setUser] = useState<UserInfo | null>(null);
@@ -54,15 +45,6 @@ export default function HomePage() {
   const [isEnding, setIsEnding] = useState(false);
   const chat = useChat(sessionId || "");
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  // 语音对话
-  const voice = useVoiceChat({
-    sessionId,
-    messages: chat.messages,
-    isStreaming: chat.isStreaming,
-    sendMessage: chat.sendMessage,
-    appendMessage: chat.appendMessage,
-  });
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -135,17 +117,10 @@ export default function HomePage() {
     if (!sessionId || isEnding) return;
     setIsEnding(true);
     try {
-      const voiceStats =
-        voice.turnCount > 0
-          ? {
-              mode: "voice",
-              ...voice.getVoiceStats(),
-            }
-          : undefined;
       const res = await fetch(`/api/sessions/${sessionId}/complete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(voiceStats ?? {}),
+        body: JSON.stringify({}),
       });
       if (res.ok) {
         router.push(`/summary/${sessionId}`);
@@ -338,26 +313,7 @@ export default function HomePage() {
       <ChatInput
         onSend={handleSend}
         disabled={chat.isStreaming || isEnding}
-        onVoiceMode={undefined}
-        voiceHint={null}
-        voiceButtonLabel="实时语音"
       />
-
-      {/* 语音对话覆盖层 */}
-      {voice.voiceState !== "idle" && (
-        <VoiceOverlay
-          voiceState={voice.voiceState}
-          currentTranscript={voice.currentTranscript}
-          displayText={voice.displayText}
-          interim={voice.interim}
-          audioLevel={voice.audioLevel}
-          turnCount={voice.turnCount}
-          providerLabel={voice.providerLabel}
-          fallbackReason={voice.fallbackReason}
-          onClose={voice.exitVoiceMode}
-          onInterrupt={voice.interrupt}
-        />
-      )}
     </div>
   );
 }
@@ -365,9 +321,6 @@ export default function HomePage() {
 function ChatInput({
   onSend,
   disabled,
-  onVoiceMode,
-  voiceHint,
-  voiceButtonLabel,
 }: {
   onSend: (
     msg: string,
@@ -378,159 +331,21 @@ function ChatInput({
     }
   ) => void;
   disabled: boolean;
-  onVoiceMode?: () => void;
-  voiceHint?: string | null;
-  voiceButtonLabel?: string;
 }) {
   const [value, setValue] = useState("");
-  const [voiceDraft, setVoiceDraft] = useState("");
-  const [isVoiceRecording, setIsVoiceRecording] = useState(false);
-  const [isVoiceSubmitting, setIsVoiceSubmitting] = useState(false);
-  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const [voiceStatus, setVoiceStatus] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
-  const voiceStartedAtRef = useRef(0);
-  const isVoiceRecordingRef = useRef(false);
-  const isVoiceFinalizingRef = useRef(false);
-  const stopVoiceMessageRef = useRef<() => Promise<void>>(async () => {});
-  const shortcutModeRef = useRef<"space" | "toggle" | null>(null);
-  const recorderStartPromiseRef = useRef<Promise<void> | null>(null);
-  const recorder = useWavRecorder();
-
-  const cleanupVoiceMedia = useCallback(() => {
-    recorder.cleanup();
-    setVoiceDraft("");
-  }, [recorder]);
-
-  const transcribeAudio = useCallback(async (blob: Blob) => {
-    const formData = new FormData();
-    formData.append("audio", blob, "voice-input.wav");
-
-    const response = await fetch("/api/asr", {
-      method: "POST",
-      body: formData,
-    });
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      const detail =
-        typeof data?.detail === "string"
-          ? data.detail
-          : typeof data?.error === "string"
-            ? data.error
-            : `ASR request failed (${response.status})`;
-      throw new Error(detail);
-    }
-
-    return typeof data?.text === "string" ? data.text.trim() : "";
-  }, []);
-
-  const stopVoiceMessage = useCallback(async () => {
-    if (!isVoiceRecordingRef.current || isVoiceFinalizingRef.current) return;
-
-    isVoiceFinalizingRef.current = true;
-    isVoiceRecordingRef.current = false;
-    shortcutModeRef.current = null;
-    setIsVoiceRecording(false);
-    setIsVoiceSubmitting(true);
-    setVoiceNotice("已录音，正在转写，转好后会自动发送...");
-
-    // Wait for recorder.start() to fully initialize before stopping
-    if (recorderStartPromiseRef.current) {
-      await recorderStartPromiseRef.current;
-      recorderStartPromiseRef.current = null;
-    }
-
-    const { blob, audioUrl, durationMs } = await recorder.stop();
-    console.log("[voice] stop result:", { blobSize: blob?.size, audioUrl: !!audioUrl, durationMs });
-
-    if (!blob || !audioUrl || durationMs <= 0) {
-      isVoiceFinalizingRef.current = false;
-      setIsVoiceSubmitting(false);
-      setVoiceDraft("");
-      setVoiceNotice("刚刚没听清，再试一次");
-      window.setTimeout(() => setVoiceNotice(null), 1600);
-      console.warn("[voice] empty recording, blob:", blob?.size, "duration:", durationMs);
-      return;
-    }
-
-    let transcript = "";
-    try {
-      transcript = await transcribeAudio(blob);
-      console.log("[voice] transcript:", transcript);
-    } catch (err) {
-      isVoiceFinalizingRef.current = false;
-      setIsVoiceSubmitting(false);
-      setVoiceDraft("");
-      setVoiceNotice("语音转写失败，再试一次");
-      window.setTimeout(() => setVoiceNotice(null), 1800);
-      console.error("[voice] transcribe error:", err);
-      return;
-    }
-
-    isVoiceFinalizingRef.current = false;
-    setIsVoiceSubmitting(false);
-    setVoiceDraft(transcript);
-    setVoiceNotice(null);
-
-    if (!transcript) {
-      setVoiceNotice("刚刚没听清，再试一次");
-      window.setTimeout(() => setVoiceNotice(null), 1600);
-      console.warn("[voice] empty transcript");
-      return;
-    }
-
-    onSend(transcript, {
-      inputMode: "voice",
-      audioUrl,
-      audioDurationMs: durationMs,
-    });
-    setValue("");
-    setVoiceDraft("");
-    if (ref.current) ref.current.style.height = "auto";
-  }, [onSend, recorder, transcribeAudio]);
-
-  useEffect(() => {
-    stopVoiceMessageRef.current = stopVoiceMessage;
-  }, [stopVoiceMessage]);
-
-  const startVoiceMessage = useCallback(async () => {
-    if (
-      disabled ||
-      !recorder.isSupported ||
-      isVoiceRecordingRef.current ||
-      isVoiceFinalizingRef.current
-    ) {
-      return;
-    }
-
-    try {
-      setVoiceNotice("开始录音了，松开后会发送语音和转写");
-      setValue("");
-      setVoiceDraft("");
-      voiceStartedAtRef.current = Date.now();
-
-      isVoiceRecordingRef.current = true;
-      setIsVoiceRecording(true);
-      const startPromise = recorder.start();
-      recorderStartPromiseRef.current = startPromise;
-      await startPromise;
-      recorderStartPromiseRef.current = null;
-      console.log("[voice] recorder started successfully");
-    } catch (err) {
-      console.error("[voice] recorder start failed:", err);
-      cleanupVoiceMedia();
-      isVoiceRecordingRef.current = false;
-      recorderStartPromiseRef.current = null;
-      shortcutModeRef.current = null;
-      setIsVoiceRecording(false);
-      setVoiceNotice("麦克风没打开，试试授权后再说");
-      window.setTimeout(() => setVoiceNotice(null), 1800);
-    }
-  }, [cleanupVoiceMedia, disabled, recorder]);
+  const keyboardRecordingRef = useRef(false);
+  const isVoiceSubmittingRef = useRef(false);
+  const {
+    isRecording,
+    error: recorderError,
+    setError: setRecorderError,
+    startRecording,
+    stopRecording,
+  } = useAudioRecorder();
 
   function handleSubmit() {
-    if (isVoiceRecording) return;
     const trimmed = value.trim();
     if (!trimmed || disabled) return;
     onSend(trimmed);
@@ -538,207 +353,175 @@ function ChatInput({
     if (ref.current) ref.current.style.height = "auto";
   }
 
-  useEffect(() => {
-    return () => {
-      cleanupVoiceMedia();
-    };
-  }, [cleanupVoiceMedia]);
+  const startVoiceRecording = useCallback(async (source: "button" | "space") => {
+    if (disabled) return;
+    if (isRecording || isVoiceSubmittingRef.current) return;
 
-  // Display value: current text + interim speech
-  const displayValue = isVoiceRecording ? voiceDraft : value;
-  const canSend =
-    !isVoiceRecording && !isVoiceSubmitting && !!displayValue.trim() && !disabled;
+    setRecorderError(null);
+    const started = await startRecording();
+    if (started) {
+      keyboardRecordingRef.current = source === "space";
+      setVoiceStatus(source === "space" ? "正在录音，松开空格发送" : "录音中，再点一次结束");
+    }
+  }, [disabled, isRecording, setRecorderError, startRecording]);
 
-  useEffect(() => {
-    if (!recorder.isSupported) return;
+  const stopVoiceRecording = useCallback(async () => {
+    if (!isRecording || isVoiceSubmittingRef.current) return;
 
-    function handleKeyDown(event: KeyboardEvent) {
-      if (disabled || event.repeat) return;
+    isVoiceSubmittingRef.current = true;
+    setVoiceStatus("正在转写...");
+    const result = await stopRecording();
 
-      const key = event.key.toLowerCase();
-      const isSpace = event.code === "Space" || event.key === " ";
-
-      if (
-        isSpace &&
-        !event.altKey &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        shouldUseSpaceForVoiceShortcut(event.target, value)
-      ) {
-        event.preventDefault();
-        if (isVoiceRecordingRef.current || isVoiceFinalizingRef.current) return;
-        shortcutModeRef.current = "space";
-        void startVoiceMessage();
-        return;
-      }
-
-      if (key === "v" && event.altKey && !event.ctrlKey && !event.metaKey) {
-        event.preventDefault();
-        if (isVoiceFinalizingRef.current) return;
-        if (isVoiceRecordingRef.current) {
-          void stopVoiceMessageRef.current();
-        } else if (!disabled) {
-          shortcutModeRef.current = "toggle";
-          void startVoiceMessage();
-        }
-      }
+    if (!result?.file || result.file.size === 0 || !result.blob) {
+      setVoiceStatus(null);
+      setRecorderError("没有录到有效语音，请再试一次");
+      keyboardRecordingRef.current = false;
+      isVoiceSubmittingRef.current = false;
+      return;
     }
 
-    function handleKeyUp(event: KeyboardEvent) {
-      if (
-        (event.code === "Space" || event.key === " ") &&
-        shortcutModeRef.current === "space" &&
-        isVoiceRecordingRef.current &&
-        !isVoiceFinalizingRef.current
-      ) {
-        event.preventDefault();
-        void stopVoiceMessageRef.current();
-      }
-    }
+    try {
+      const audioUrl = await blobToDataUrl(result.blob);
+      const formData = new FormData();
+      formData.append("file", result.file);
 
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-    };
-  }, [disabled, recorder.isSupported, startVoiceMessage, value]);
+      const response = await fetch("/api/asr", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Transcription failed");
+      }
+
+      const transcript = (data.text || "").trim();
+      if (!transcript) {
+        throw new Error("没有识别到文字");
+      }
+
+      onSend(transcript, {
+        inputMode: "voice",
+        audioUrl,
+        audioDurationMs: result.durationMs,
+      });
+      setVoiceStatus(null);
+    } catch (error) {
+      console.error("Voice transcription failed:", error);
+      setVoiceStatus(null);
+      setRecorderError("语音转写失败，请再试一次");
+    } finally {
+      keyboardRecordingRef.current = false;
+      isVoiceSubmittingRef.current = false;
+    }
+  }, [isRecording, onSend, setRecorderError, stopRecording]);
+
+  async function handleVoiceToggle() {
+    if (isRecording) {
+      await stopVoiceRecording();
+      return;
+    }
+    await startVoiceRecording("button");
+  }
 
   useEffect(() => {
     if (!ref.current) return;
     ref.current.style.height = "auto";
     ref.current.style.height = Math.min(ref.current.scrollHeight, 120) + "px";
-  }, [displayValue]);
+  }, [value]);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.code !== "Space") return;
+      if (event.repeat || disabled || isRecording || isVoiceSubmittingRef.current) return;
+      if (value.trim()) return;
+
+      const activeElement = document.activeElement;
+      const isTypingField =
+        activeElement instanceof HTMLInputElement ||
+        activeElement instanceof HTMLSelectElement ||
+        activeElement instanceof HTMLButtonElement ||
+        (activeElement instanceof HTMLTextAreaElement && activeElement.value.trim().length > 0);
+
+      if (isTypingField) return;
+
+      event.preventDefault();
+      void startVoiceRecording("space");
+    }
+
+    function onKeyUp(event: KeyboardEvent) {
+      if (event.code !== "Space") return;
+      if (!keyboardRecordingRef.current) return;
+      event.preventDefault();
+      void stopVoiceRecording();
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [disabled, isRecording, startVoiceRecording, stopVoiceRecording, value]);
+
+  const canSend = !!value.trim() && !disabled;
+  const voiceHint =
+    recorderError || voiceStatus || "点击麦克风开始，或按住空格说话，松开发送";
 
   return (
     <div className="border-t border-slate-100 bg-white px-4 py-3">
-      {/* Listening indicator */}
-      {isVoiceRecording && (
-        <div className="mx-auto max-w-2xl mb-2 flex items-center justify-center gap-2">
-          <span className="relative flex h-2.5 w-2.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-          <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
-          </span>
-          <span className="text-xs text-red-500 font-medium">
-            正在录音，松开空格会发送
-          </span>
-        </div>
-      )}
-
-      {isVoiceSubmitting && (
-        <div className="mx-auto max-w-2xl mb-2 flex items-center justify-center gap-2">
-          <span className="relative flex h-2.5 w-2.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
-            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-sky-500" />
-          </span>
-          <span className="text-xs text-sky-500 font-medium">
-            正在转写，转好后会自动发送
-          </span>
-        </div>
-      )}
-
-      {voiceNotice && (
-        <div className="mx-auto mb-2 max-w-2xl text-center text-xs text-slate-400">
-          {voiceNotice}
-        </div>
-      )}
-
-      {recorder.isSupported && (
-        <div className="mx-auto mb-2 max-w-2xl text-center text-[11px] text-slate-300">
-          快捷键：按住空格说话，松开后会发送语音和转写；或按 <span className="font-medium text-slate-400">Alt + V</span> 开始/结束语音
-        </div>
-      )}
-
-      {voiceHint && onVoiceMode && (
-        <div className="mx-auto max-w-2xl mb-2 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-700">
+      <div className="mx-auto max-w-2xl space-y-2">
+        <p className={`text-xs ${recorderError ? "text-red-500" : "text-slate-400"}`}>
           {voiceHint}
-        </div>
-      )}
-
-      <div className="mx-auto flex max-w-2xl items-end gap-2">
-        {/* Voice mode button */}
-        {onVoiceMode && (
+        </p>
+        <div className="flex items-end gap-2">
           <button
-            onClick={onVoiceMode}
+            type="button"
+            onClick={handleVoiceToggle}
             disabled={disabled}
-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-sky-400 to-cyan-500 text-white transition-all hover:from-sky-500 hover:to-cyan-600 active:scale-95 disabled:opacity-30"
-            title={voiceButtonLabel || "语音对话模式"}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-              <line x1="12" y1="19" x2="12" y2="23" />
-              <line x1="8" y1="23" x2="16" y2="23" />
-            </svg>
-          </button>
-        )}
-
-        {/* Mic button (text input assist) */}
-        {recorder.isSupported && (
-          <button
-            onClick={() => {
-              if (isVoiceFinalizingRef.current) return;
-              if (isVoiceRecordingRef.current) {
-                void stopVoiceMessageRef.current();
-              } else {
-                void startVoiceMessage();
-              }
-            }}
-            disabled={disabled}
-            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all ${
-              isVoiceRecording || isVoiceSubmitting
-                ? "bg-red-500 text-white animate-pulse"
-                : "bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700"
+            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border transition-colors ${
+              isRecording
+                ? "border-red-200 bg-red-50 text-red-500 hover:bg-red-100"
+                : "border-slate-200 bg-slate-50 text-slate-500 hover:bg-slate-100"
             } disabled:opacity-30`}
-            title={isVoiceRecording || isVoiceSubmitting ? "结束并发送语音" : "语音输入"}
+            title={isRecording ? "结束录音" : "开始录音"}
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
-              <path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v8.25a3.75 3.75 0 1 1-7.5 0V4.5Z" />
-              <path d="M6 10.5a.75.75 0 0 1 .75.75v1.5a5.25 5.25 0 1 0 10.5 0v-1.5a.75.75 0 0 1 1.5 0v1.5a6.751 6.751 0 0 1-6 6.709v2.291h3a.75.75 0 0 1 0 1.5h-7.5a.75.75 0 0 1 0-1.5h3v-2.291a6.751 6.751 0 0 1-6-6.709v-1.5A.75.75 0 0 1 6 10.5Z" />
+              <path d="M8.25 5.25A3.75 3.75 0 0 1 12 1.5a3.75 3.75 0 0 1 3.75 3.75v6a3.75 3.75 0 0 1-7.5 0v-6Z" />
+              <path d="M6 10.5a.75.75 0 0 1 .75.75v.75a5.25 5.25 0 0 0 10.5 0v-.75a.75.75 0 0 1 1.5 0v.75a6.75 6.75 0 0 1-6 6.705V21a.75.75 0 0 1-1.5 0v-2.295a6.75 6.75 0 0 1-6-6.705v-.75A.75.75 0 0 1 6 10.5Z" />
             </svg>
           </button>
-        )}
-
-        <textarea
-          ref={ref}
-          value={displayValue}
-          onChange={(e) => {
-            if (isVoiceRecording) return;
-            setValue(e.target.value);
-          }}
-          onKeyDown={(e) => {
-            if (isVoiceRecording) return;
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              handleSubmit();
-            }
-          }}
-          onInput={(e) => {
-            const el = e.target as HTMLTextAreaElement;
-            el.style.height = "auto";
-            el.style.height = Math.min(el.scrollHeight, 120) + "px";
-          }}
-          placeholder={
-            isVoiceRecording
-              ? "正在录音，松开就会发送..."
-              : isVoiceSubmitting
-                ? "正在转写，完成后会自动发送..."
-              : "说点什么..."
-          }
-          disabled={disabled}
-          readOnly={isVoiceRecording || isVoiceSubmitting}
-          rows={1}
-          className="flex-1 resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-[15px] leading-relaxed placeholder:text-slate-400 focus:border-slate-300 focus:outline-none focus:ring-0 disabled:opacity-50"
-        />
-        <button
-          onClick={handleSubmit}
-          disabled={!canSend}
-          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white transition-colors hover:bg-slate-800 disabled:opacity-30"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
-            <path d="M3.478 2.404a.75.75 0 0 0-.926.941l2.432 7.905H13.5a.75.75 0 0 1 0 1.5H4.984l-2.432 7.905a.75.75 0 0 0 .926.94 60.519 60.519 0 0 0 18.445-8.986.75.75 0 0 0 0-1.218A60.517 60.517 0 0 0 3.478 2.404Z" />
-          </svg>
-        </button>
+          <textarea
+            ref={ref}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit();
+              }
+            }}
+            onInput={(e) => {
+              const el = e.target as HTMLTextAreaElement;
+              el.style.height = "auto";
+              el.style.height = Math.min(el.scrollHeight, 120) + "px";
+            }}
+            placeholder="说点什么..."
+            disabled={disabled}
+            rows={1}
+            className="flex-1 resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-[15px] leading-relaxed placeholder:text-slate-400 focus:border-slate-300 focus:outline-none focus:ring-0 disabled:opacity-50"
+          />
+          <button
+            onClick={handleSubmit}
+            disabled={!canSend}
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white transition-colors hover:bg-slate-800 disabled:opacity-30"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
+              <path d="M3.478 2.404a.75.75 0 0 0-.926.941l2.432 7.905H13.5a.75.75 0 0 1 0 1.5H4.984l-2.432 7.905a.75.75 0 0 0 .926.94 60.519 60.519 0 0 0 18.445-8.986.75.75 0 0 0 0-1.218A60.517 60.517 0 0 0 3.478 2.404Z" />
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
   );

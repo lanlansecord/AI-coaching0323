@@ -63,6 +63,8 @@ export function useChat(sessionId: string) {
           body: JSON.stringify({
             message: trimmedContent,
             inputMode: options?.inputMode || "text",
+            audioUrl: options?.audioUrl,
+            audioDurationMs: options?.audioDurationMs,
           }),
           signal: abortRef.current.signal,
         });
