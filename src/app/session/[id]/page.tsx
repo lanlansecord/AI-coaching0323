@@ -17,6 +17,12 @@ interface SessionMeta {
   createdAt: string;
 }
 
+function formatVoiceDuration(durationMs?: number) {
+  if (!durationMs || durationMs <= 0) return null;
+  const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
+  return `${totalSeconds}"`;
+}
+
 export default function SessionPage() {
   const params = useParams();
   const router = useRouter();
@@ -41,10 +47,20 @@ export default function SessionPage() {
           const data = await res.json();
           initMessages(
             data.messages.map(
-              (m: { id: string; role: string; content: string }) => ({
+              (m: {
+                id: string;
+                role: string;
+                content: string;
+                inputMode?: "text" | "voice";
+                audioUrl?: string;
+                audioDurationMs?: number;
+              }) => ({
                 id: m.id,
                 role: m.role as "user" | "assistant",
                 content: m.content,
+                inputMode: m.inputMode,
+                audioUrl: m.audioUrl,
+                audioDurationMs: m.audioDurationMs,
               })
             )
           );
@@ -251,7 +267,27 @@ export default function SessionPage() {
                 }`}
               >
                 {msg.content ? (
-                  <p className="whitespace-pre-wrap">{msg.content}</p>
+                  msg.role === "user" && msg.inputMode === "voice" ? (
+                    <div className="space-y-2">
+                      <div className="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1 text-xs text-white/80">
+                        <span>{msg.audioUrl ? "🎤 语音消息" : "🎤 语音转写"}</span>
+                        {formatVoiceDuration(msg.audioDurationMs) && (
+                          <span>{formatVoiceDuration(msg.audioDurationMs)}</span>
+                        )}
+                      </div>
+                      {msg.audioUrl && (
+                        <audio
+                          controls
+                          src={msg.audioUrl}
+                          preload="metadata"
+                          className="block h-10 w-full max-w-xs"
+                        />
+                      )}
+                      <p className="whitespace-pre-wrap text-white/95">{msg.content}</p>
+                    </div>
+                  ) : (
+                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                  )
                 ) : (
                   <span className="inline-flex items-center gap-1 text-slate-400">
                     <span

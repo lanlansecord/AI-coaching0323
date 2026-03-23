@@ -52,6 +52,8 @@ export const messages = pgTable('messages', {
   role: varchar('role', { length: 20 }).notNull(),
   content: text('content').notNull(),
   inputMode: varchar('input_mode', { length: 10 }).default('text'),
+  audioUrl: text('audio_url'),
+  audioDurationMs: integer('audio_duration_ms'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
