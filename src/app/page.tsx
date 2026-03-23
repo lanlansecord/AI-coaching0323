@@ -442,6 +442,7 @@ function ChatInput({
     }
 
     const { blob, audioUrl, durationMs } = await recorder.stop();
+    console.log("[voice] stop result:", { blobSize: blob?.size, audioUrl: !!audioUrl, durationMs });
 
     if (!blob || !audioUrl || durationMs <= 0) {
       isVoiceFinalizingRef.current = false;
@@ -449,18 +450,21 @@ function ChatInput({
       setVoiceDraft("");
       setVoiceNotice("刚刚没听清，再试一次");
       window.setTimeout(() => setVoiceNotice(null), 1600);
+      console.warn("[voice] empty recording, blob:", blob?.size, "duration:", durationMs);
       return;
     }
 
     let transcript = "";
     try {
       transcript = await transcribeAudio(blob);
-    } catch {
+      console.log("[voice] transcript:", transcript);
+    } catch (err) {
       isVoiceFinalizingRef.current = false;
       setIsVoiceSubmitting(false);
       setVoiceDraft("");
       setVoiceNotice("语音转写失败，再试一次");
       window.setTimeout(() => setVoiceNotice(null), 1800);
+      console.error("[voice] transcribe error:", err);
       return;
     }
 
@@ -472,6 +476,7 @@ function ChatInput({
     if (!transcript) {
       setVoiceNotice("刚刚没听清，再试一次");
       window.setTimeout(() => setVoiceNotice(null), 1600);
+      console.warn("[voice] empty transcript");
       return;
     }
 
@@ -511,7 +516,9 @@ function ChatInput({
       recorderStartPromiseRef.current = startPromise;
       await startPromise;
       recorderStartPromiseRef.current = null;
-    } catch {
+      console.log("[voice] recorder started successfully");
+    } catch (err) {
+      console.error("[voice] recorder start failed:", err);
       cleanupVoiceMedia();
       isVoiceRecordingRef.current = false;
       recorderStartPromiseRef.current = null;

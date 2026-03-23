@@ -144,6 +144,9 @@ export function useWavRecorder() {
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioContext = new AudioContextClass();
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
     const source = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
     const gain = audioContext.createGain();
