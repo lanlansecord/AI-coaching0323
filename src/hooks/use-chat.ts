@@ -15,6 +15,8 @@ export function useChat(sessionId: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const flushTimerRef = useRef<number | null>(null);
+  const pendingChunkRef = useRef("");
 
   const initMessages = useCallback((initialMessages: ChatMessage[]) => {
     setMessages(initialMessages);
@@ -29,18 +31,18 @@ export function useChat(sessionId: string) {
         audioDurationMs?: number;
       }
     ) => {
-      if (isStreaming || !content.trim()) return;
+      const trimmedContent = content.trim();
+      if (isStreaming || !trimmedContent) return;
 
       // Add user message optimistically
       const userMsg: ChatMessage = {
         id: `user-${Date.now()}`,
         role: "user",
-        content: content.trim(),
+        content: trimmedContent,
         inputMode: options?.inputMode || "text",
         audioUrl: options?.audioUrl,
         audioDurationMs: options?.audioDurationMs,
       };
-      setMessages((prev) => [...prev, userMsg]);
 
       // Add placeholder for assistant
       const assistantId = `assistant-${Date.now()}`;
@@ -49,7 +51,7 @@ export function useChat(sessionId: string) {
         role: "assistant",
         content: "",
       };
-      setMessages((prev) => [...prev, assistantMsg]);
+      setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
       setIsStreaming(true);
       abortRef.current = new AbortController();
@@ -59,7 +61,7 @@ export function useChat(sessionId: string) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            message: content.trim(),
+            message: trimmedContent,
             inputMode: options?.inputMode || "text",
           }),
           signal: abortRef.current.signal,
@@ -72,8 +74,40 @@ export function useChat(sessionId: string) {
 
         const decoder = new TextDecoder();
         let buffer = "";
+        let isDone = false;
 
-        while (true) {
+        const flushPendingChunk = () => {
+          if (!pendingChunkRef.current) return;
+
+          const nextChunk = pendingChunkRef.current;
+          pendingChunkRef.current = "";
+
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? { ...message, content: message.content + nextChunk }
+                : message
+            )
+          );
+        };
+
+        const clearFlushTimer = () => {
+          if (flushTimerRef.current !== null) {
+            window.clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+          }
+        };
+
+        const scheduleFlush = () => {
+          if (flushTimerRef.current !== null) return;
+
+          flushTimerRef.current = window.setTimeout(() => {
+            flushTimerRef.current = null;
+            flushPendingChunk();
+          }, 40);
+        };
+
+        while (!isDone) {
           const { done, value } = await reader.read();
           if (done) break;
 
@@ -84,18 +118,18 @@ export function useChat(sessionId: string) {
           for (const line of lines) {
             if (line.startsWith("data: ")) {
               const data = line.slice(6).trim();
-              if (data === "[DONE]") break;
+              if (data === "[DONE]") {
+                isDone = true;
+                clearFlushTimer();
+                flushPendingChunk();
+                break;
+              }
 
               try {
                 const parsed = JSON.parse(data);
                 if (parsed.content) {
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === assistantId
-                        ? { ...m, content: m.content + parsed.content }
-                        : m
-                    )
-                  );
+                  pendingChunkRef.current += parsed.content;
+                  scheduleFlush();
                 }
               } catch {
                 // Skip malformed data
@@ -103,6 +137,9 @@ export function useChat(sessionId: string) {
             }
           }
         }
+
+        clearFlushTimer();
+        flushPendingChunk();
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
           setMessages((prev) =>
@@ -114,6 +151,11 @@ export function useChat(sessionId: string) {
           );
         }
       } finally {
+        if (flushTimerRef.current !== null) {
+          window.clearTimeout(flushTimerRef.current);
+          flushTimerRef.current = null;
+        }
+        pendingChunkRef.current = "";
         setIsStreaming(false);
         abortRef.current = null;
       }

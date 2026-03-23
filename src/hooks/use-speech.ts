@@ -46,6 +46,7 @@ export function useSpeech(onResult: (text: string) => void) {
   const onResultRef = useRef(onResult);
   const interimRef = useRef("");
   const shouldFlushOnEndRef = useRef(true);
+  const stopResolveRef = useRef<(() => void) | null>(null);
   const isSupported =
     typeof window !== "undefined" &&
     ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
@@ -134,9 +135,12 @@ export function useSpeech(onResult: (text: string) => void) {
       if (shouldFlushOnEndRef.current) {
         flushInterim();
       }
+      recognitionRef.current = null;
       setIsListening(false);
       isListeningRef.current = false;
       setInterim("");
+      stopResolveRef.current?.();
+      stopResolveRef.current = null;
     };
 
     recognitionRef.current = recognition;
@@ -145,6 +149,7 @@ export function useSpeech(onResult: (text: string) => void) {
       recognition.start();
     } catch (e) {
       console.warn("Failed to start speech recognition:", e);
+      recognitionRef.current = null;
       setIsListening(false);
       isListeningRef.current = false;
     }
@@ -152,16 +157,46 @@ export function useSpeech(onResult: (text: string) => void) {
 
   const stopListening = useCallback((options?: { flushInterim?: boolean }) => {
     shouldFlushOnEndRef.current = options?.flushInterim !== false;
-    if (options?.flushInterim !== false) {
-      flushInterim();
-    }
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch { /* */ }
-      recognitionRef.current = null;
     }
-    setIsListening(false);
-    isListeningRef.current = false;
-    setInterim("");
+  }, []);
+
+  const stopListeningAndWait = useCallback(async (options?: {
+    flushInterim?: boolean;
+    timeoutMs?: number;
+  }) => {
+    if (!recognitionRef.current || !isListeningRef.current) {
+      if (options?.flushInterim !== false) {
+        flushInterim();
+      }
+      return;
+    }
+
+    shouldFlushOnEndRef.current = options?.flushInterim !== false;
+
+    const waitForEnd = new Promise<void>((resolve) => {
+      stopResolveRef.current = resolve;
+    });
+
+    try {
+      recognitionRef.current.stop();
+    } catch {
+      stopResolveRef.current?.();
+      stopResolveRef.current = null;
+      recognitionRef.current = null;
+      setIsListening(false);
+      isListeningRef.current = false;
+      setInterim("");
+      return;
+    }
+
+    await Promise.race([
+      waitForEnd,
+      new Promise<void>((resolve) => {
+        window.setTimeout(resolve, options?.timeoutMs ?? 1200);
+      }),
+    ]);
   }, [flushInterim]);
 
   const toggleListening = useCallback(() => {
@@ -187,6 +222,7 @@ export function useSpeech(onResult: (text: string) => void) {
     isSupported,
     startListening,
     stopListening,
+    stopListeningAndWait,
     toggleListening,
   };
 }

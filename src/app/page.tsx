@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useChat } from "@/hooks/use-chat";
-import { useSpeech } from "@/hooks/use-speech";
+import { useWavRecorder } from "@/hooks/use-wav-recorder";
 import { useVoiceChat } from "@/hooks/use-voice-chat";
 import { VoiceOverlay } from "@/components/voice/VoiceOverlay";
 import type { EntryTag } from "@/types";
@@ -20,6 +20,17 @@ function isEditableElement(target: EventTarget | null) {
     tagName === "SELECT" ||
     target.isContentEditable
   );
+}
+
+function shouldUseSpaceForVoiceShortcut(target: EventTarget | null, currentValue: string) {
+  if (!(target instanceof HTMLElement)) return true;
+  if (!isEditableElement(target)) return true;
+
+  // 输入框里已经有文字时，保留正常空格输入。
+  if (currentValue.trim()) return false;
+
+  // 空输入框允许直接按住空格开始录音。
+  return true;
 }
 
 interface UserInfo {
@@ -374,52 +385,88 @@ function ChatInput({
   const [value, setValue] = useState("");
   const [voiceDraft, setVoiceDraft] = useState("");
   const [isVoiceRecording, setIsVoiceRecording] = useState(false);
+  const [isVoiceSubmitting, setIsVoiceSubmitting] = useState(false);
   const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const voiceStartedAtRef = useRef(0);
-  const voiceDraftRef = useRef("");
   const isVoiceRecordingRef = useRef(false);
   const isVoiceFinalizingRef = useRef(false);
-  const hasVoiceSessionStartedRef = useRef(false);
   const stopVoiceMessageRef = useRef<() => Promise<void>>(async () => {});
   const shortcutModeRef = useRef<"space" | "toggle" | null>(null);
-
-  // Speech recognition
-  const speech = useSpeech(
-    useCallback((text: string) => {
-      if (isVoiceRecordingRef.current || isVoiceFinalizingRef.current) {
-        voiceDraftRef.current += text;
-        setVoiceDraft(voiceDraftRef.current);
-        return;
-      }
-      setValue((prev) => prev + text);
-    }, [])
-  );
+  const recorderStartPromiseRef = useRef<Promise<void> | null>(null);
+  const recorder = useWavRecorder();
 
   const cleanupVoiceMedia = useCallback(() => {
-    hasVoiceSessionStartedRef.current = false;
+    recorder.cleanup();
+    setVoiceDraft("");
+  }, [recorder]);
+
+  const transcribeAudio = useCallback(async (blob: Blob) => {
+    const formData = new FormData();
+    formData.append("audio", blob, "voice-input.wav");
+
+    const response = await fetch("/api/asr", {
+      method: "POST",
+      body: formData,
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      const detail =
+        typeof data?.detail === "string"
+          ? data.detail
+          : typeof data?.error === "string"
+            ? data.error
+            : `ASR request failed (${response.status})`;
+      throw new Error(detail);
+    }
+
+    return typeof data?.text === "string" ? data.text.trim() : "";
   }, []);
 
   const stopVoiceMessage = useCallback(async () => {
-    if (!isVoiceRecordingRef.current) return;
+    if (!isVoiceRecordingRef.current || isVoiceFinalizingRef.current) return;
 
     isVoiceFinalizingRef.current = true;
     isVoiceRecordingRef.current = false;
     shortcutModeRef.current = null;
     setIsVoiceRecording(false);
-    setVoiceNotice("正在整理文字...");
+    setIsVoiceSubmitting(true);
+    setVoiceNotice("已录音，正在转写，转好后会自动发送...");
 
-    const transcript = `${voiceDraftRef.current}${speech.interim}`.trim();
-    if (speech.isListening) {
-      speech.stopListening({ flushInterim: false });
+    // Wait for recorder.start() to fully initialize before stopping
+    if (recorderStartPromiseRef.current) {
+      await recorderStartPromiseRef.current;
+      recorderStartPromiseRef.current = null;
     }
-    const audioDurationMs = voiceStartedAtRef.current
-      ? Date.now() - voiceStartedAtRef.current
-      : 0;
+
+    const { blob, audioUrl, durationMs } = await recorder.stop();
+
+    if (!blob || !audioUrl || durationMs <= 0) {
+      isVoiceFinalizingRef.current = false;
+      setIsVoiceSubmitting(false);
+      setVoiceDraft("");
+      setVoiceNotice("刚刚没听清，再试一次");
+      window.setTimeout(() => setVoiceNotice(null), 1600);
+      return;
+    }
+
+    let transcript = "";
+    try {
+      transcript = await transcribeAudio(blob);
+    } catch {
+      isVoiceFinalizingRef.current = false;
+      setIsVoiceSubmitting(false);
+      setVoiceDraft("");
+      setVoiceNotice("语音转写失败，再试一次");
+      window.setTimeout(() => setVoiceNotice(null), 1800);
+      return;
+    }
 
     isVoiceFinalizingRef.current = false;
-    voiceDraftRef.current = "";
-    setVoiceDraft("");
+    setIsVoiceSubmitting(false);
+    setVoiceDraft(transcript);
     setVoiceNotice(null);
 
     if (!transcript) {
@@ -430,46 +477,55 @@ function ChatInput({
 
     onSend(transcript, {
       inputMode: "voice",
-      audioDurationMs,
+      audioUrl,
+      audioDurationMs: durationMs,
     });
     setValue("");
+    setVoiceDraft("");
     if (ref.current) ref.current.style.height = "auto";
-  }, [onSend, speech]);
+  }, [onSend, recorder, transcribeAudio]);
 
   useEffect(() => {
     stopVoiceMessageRef.current = stopVoiceMessage;
   }, [stopVoiceMessage]);
 
   const startVoiceMessage = useCallback(async () => {
-    if (disabled || !speech.isSupported || isVoiceRecordingRef.current) return;
+    if (
+      disabled ||
+      !recorder.isSupported ||
+      isVoiceRecordingRef.current ||
+      isVoiceFinalizingRef.current
+    ) {
+      return;
+    }
 
     try {
-      setVoiceNotice("点一下开始说，停 1 秒会自动发送文字");
+      setVoiceNotice("开始录音了，松开后会发送语音和转写");
       setValue("");
       setVoiceDraft("");
-      voiceDraftRef.current = "";
       voiceStartedAtRef.current = Date.now();
-      hasVoiceSessionStartedRef.current = false;
 
       isVoiceRecordingRef.current = true;
       setIsVoiceRecording(true);
-      await Promise.resolve(speech.startListening({ continuous: false }));
+      const startPromise = recorder.start();
+      recorderStartPromiseRef.current = startPromise;
+      await startPromise;
+      recorderStartPromiseRef.current = null;
     } catch {
       cleanupVoiceMedia();
       isVoiceRecordingRef.current = false;
+      recorderStartPromiseRef.current = null;
       shortcutModeRef.current = null;
       setIsVoiceRecording(false);
       setVoiceNotice("麦克风没打开，试试授权后再说");
       window.setTimeout(() => setVoiceNotice(null), 1800);
     }
-  }, [cleanupVoiceMedia, disabled, speech]);
+  }, [cleanupVoiceMedia, disabled, recorder]);
 
   function handleSubmit() {
     if (isVoiceRecording) return;
-    const trimmed = (value + speech.interim).trim();
+    const trimmed = value.trim();
     if (!trimmed || disabled) return;
-    // Stop listening if sending
-    if (speech.isListening) speech.stopListening();
     onSend(trimmed);
     setValue("");
     if (ref.current) ref.current.style.height = "auto";
@@ -478,65 +534,29 @@ function ChatInput({
   useEffect(() => {
     return () => {
       cleanupVoiceMedia();
-      if (speech.isListening) {
-        speech.stopListening({ flushInterim: false });
-      }
     };
-  }, [cleanupVoiceMedia, speech]);
-
-  useEffect(() => {
-    if (isVoiceRecording && speech.isListening) {
-      hasVoiceSessionStartedRef.current = true;
-    }
-  }, [isVoiceRecording, speech.isListening]);
-
-  useEffect(() => {
-    if (
-      !isVoiceRecordingRef.current ||
-      isVoiceFinalizingRef.current ||
-      speech.isListening ||
-      !hasVoiceSessionStartedRef.current
-    ) {
-      return;
-    }
-
-    if (!voiceDraftRef.current.trim() && !speech.interim.trim()) {
-      window.setTimeout(() => {
-        setIsVoiceRecording(false);
-        isVoiceRecordingRef.current = false;
-        shortcutModeRef.current = null;
-        setVoiceNotice("刚刚没听清，再试一次");
-        window.setTimeout(() => setVoiceNotice(null), 1600);
-      }, 0);
-      return;
-    }
-
-    void stopVoiceMessageRef.current();
-  }, [speech.interim, speech.isListening]);
+  }, [cleanupVoiceMedia]);
 
   // Display value: current text + interim speech
-  const displayValue = isVoiceRecording
-    ? voiceDraft + speech.interim
-    : speech.interim
-      ? value + speech.interim
-      : value;
-  const canSend = !isVoiceRecording && !!displayValue.trim() && !disabled;
+  const displayValue = isVoiceRecording ? voiceDraft : value;
+  const canSend =
+    !isVoiceRecording && !isVoiceSubmitting && !!displayValue.trim() && !disabled;
 
   useEffect(() => {
-    if (!speech.isSupported) return;
+    if (!recorder.isSupported) return;
 
     function handleKeyDown(event: KeyboardEvent) {
       if (disabled || event.repeat) return;
 
       const key = event.key.toLowerCase();
-      const editable = isEditableElement(event.target);
+      const isSpace = event.code === "Space" || event.key === " ";
 
       if (
-        event.key === " " &&
+        isSpace &&
         !event.altKey &&
         !event.ctrlKey &&
         !event.metaKey &&
-        !editable
+        shouldUseSpaceForVoiceShortcut(event.target, value)
       ) {
         event.preventDefault();
         if (isVoiceRecordingRef.current || isVoiceFinalizingRef.current) return;
@@ -559,7 +579,7 @@ function ChatInput({
 
     function handleKeyUp(event: KeyboardEvent) {
       if (
-        event.key === " " &&
+        (event.code === "Space" || event.key === " ") &&
         shortcutModeRef.current === "space" &&
         isVoiceRecordingRef.current &&
         !isVoiceFinalizingRef.current
@@ -575,7 +595,7 @@ function ChatInput({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [disabled, speech.isSupported, startVoiceMessage]);
+  }, [disabled, recorder.isSupported, startVoiceMessage, value]);
 
   useEffect(() => {
     if (!ref.current) return;
@@ -586,14 +606,26 @@ function ChatInput({
   return (
     <div className="border-t border-slate-100 bg-white px-4 py-3">
       {/* Listening indicator */}
-      {speech.isListening && (
+      {isVoiceRecording && (
         <div className="mx-auto max-w-2xl mb-2 flex items-center justify-center gap-2">
           <span className="relative flex h-2.5 w-2.5">
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
           <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
           </span>
           <span className="text-xs text-red-500 font-medium">
-            {isVoiceRecording ? "正在听你说，停一下会自动发送文字..." : "正在听你说..."}
+            正在录音，松开空格会发送
+          </span>
+        </div>
+      )}
+
+      {isVoiceSubmitting && (
+        <div className="mx-auto max-w-2xl mb-2 flex items-center justify-center gap-2">
+          <span className="relative flex h-2.5 w-2.5">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
+            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-sky-500" />
+          </span>
+          <span className="text-xs text-sky-500 font-medium">
+            正在转写，转好后会自动发送
           </span>
         </div>
       )}
@@ -604,9 +636,9 @@ function ChatInput({
         </div>
       )}
 
-      {speech.isSupported && (
+      {recorder.isSupported && (
         <div className="mx-auto mb-2 max-w-2xl text-center text-[11px] text-slate-300">
-          快捷键：按住空格说话，松开发送；或按 <span className="font-medium text-slate-400">Alt + V</span> 开始/结束语音转文字
+          快捷键：按住空格说话，松开后会发送语音和转写；或按 <span className="font-medium text-slate-400">Alt + V</span> 开始/结束语音
         </div>
       )}
 
@@ -635,22 +667,23 @@ function ChatInput({
         )}
 
         {/* Mic button (text input assist) */}
-        {speech.isSupported && (
+        {recorder.isSupported && (
           <button
             onClick={() => {
-              if (isVoiceRecording) {
-                void stopVoiceMessage();
+              if (isVoiceFinalizingRef.current) return;
+              if (isVoiceRecordingRef.current) {
+                void stopVoiceMessageRef.current();
               } else {
                 void startVoiceMessage();
               }
             }}
             disabled={disabled}
             className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all ${
-              isVoiceRecording
+              isVoiceRecording || isVoiceSubmitting
                 ? "bg-red-500 text-white animate-pulse"
                 : "bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700"
             } disabled:opacity-30`}
-            title={isVoiceRecording ? "结束并发送文字" : "语音转文字"}
+            title={isVoiceRecording || isVoiceSubmitting ? "结束并发送语音" : "语音输入"}
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
               <path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v8.25a3.75 3.75 0 1 1-7.5 0V4.5Z" />
@@ -680,13 +713,13 @@ function ChatInput({
           }}
           placeholder={
             isVoiceRecording
-              ? "正在转成文字，停一下就会自动发送..."
-              : speech.isListening
-                ? "说话中..."
-                : "说点什么..."
+              ? "正在录音，松开就会发送..."
+              : isVoiceSubmitting
+                ? "正在转写，完成后会自动发送..."
+              : "说点什么..."
           }
           disabled={disabled}
-          readOnly={isVoiceRecording}
+          readOnly={isVoiceRecording || isVoiceSubmitting}
           rows={1}
           className="flex-1 resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-[15px] leading-relaxed placeholder:text-slate-400 focus:border-slate-300 focus:outline-none focus:ring-0 disabled:opacity-50"
         />
