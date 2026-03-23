@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { messages } from '@/lib/db/schema';
 import { eq, asc } from 'drizzle-orm';
-import { ensureVoiceMessageColumns } from '@/lib/db/ensure-voice-message-columns';
 
 export async function GET(
   _request: NextRequest,
@@ -11,8 +10,6 @@ export async function GET(
   const { id: sessionId } = await params;
 
   try {
-    await ensureVoiceMessageColumns();
-
     const allMessages = await db
       .select()
       .from(messages)
@@ -24,9 +21,6 @@ export async function GET(
         id: m.id,
         role: m.role,
         content: m.content,
-        inputMode: m.inputMode,
-        audioUrl: m.audioUrl,
-        audioDurationMs: m.audioDurationMs,
       })),
     });
   } catch (error) {
@@ -49,8 +43,6 @@ export async function POST(
       role?: string;
       content?: string;
       inputMode?: string;
-      audioUrl?: string;
-      audioDurationMs?: number;
     };
 
     if (!body.role || !body.content?.trim()) {
@@ -64,8 +56,6 @@ export async function POST(
       return NextResponse.json({ error: 'invalid role' }, { status: 400 });
     }
 
-    await ensureVoiceMessageColumns();
-
     const [message] = await db
       .insert(messages)
       .values({
@@ -73,11 +63,6 @@ export async function POST(
         role: body.role,
         content: body.content.trim(),
         inputMode: body.inputMode === 'voice' ? 'voice' : 'text',
-        audioUrl: body.inputMode === 'voice' && typeof body.audioUrl === 'string' ? body.audioUrl : null,
-        audioDurationMs:
-          body.inputMode === 'voice' && typeof body.audioDurationMs === 'number'
-            ? Math.max(0, Math.round(body.audioDurationMs))
-            : null,
       })
       .returning();
 
@@ -86,9 +71,6 @@ export async function POST(
         id: message.id,
         role: message.role,
         content: message.content,
-        inputMode: message.inputMode,
-        audioUrl: message.audioUrl,
-        audioDurationMs: message.audioDurationMs,
       },
     });
   } catch (error) {
