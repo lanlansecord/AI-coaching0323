@@ -4,7 +4,6 @@ import { sessions, messages } from '@/lib/db/schema';
 import { eq, desc } from 'drizzle-orm';
 import { getAIClient, getModel } from '@/lib/ai/client';
 import { buildSystemPrompt } from '@/lib/ai/prompts';
-import { ensureVoiceMessageColumns } from '@/lib/db/ensure-voice-message-columns';
 import type { EntryTag } from '@/types';
 
 export const runtime = 'nodejs';
@@ -49,14 +48,6 @@ export async function POST(
     const body = await request.json();
     const userMessage = body.message?.trim();
     const inputMode = body.inputMode === 'voice' ? 'voice' : 'text';
-    const audioUrl =
-      inputMode === 'voice' && typeof body.audioUrl === 'string'
-        ? body.audioUrl
-        : null;
-    const audioDurationMs =
-      inputMode === 'voice' && typeof body.audioDurationMs === 'number'
-        ? Math.max(0, Math.round(body.audioDurationMs))
-        : null;
 
     if (!userMessage) {
       return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -64,8 +55,6 @@ export async function POST(
         headers: { 'Content-Type': 'application/json' },
       });
     }
-
-    await ensureVoiceMessageColumns();
 
     const [sessionResult, recentHistory] = await Promise.all([
       db
@@ -98,8 +87,6 @@ export async function POST(
       role: 'user',
       content: userMessage,
       inputMode,
-      audioUrl,
-      audioDurationMs,
     });
 
     // Build messages for AI
